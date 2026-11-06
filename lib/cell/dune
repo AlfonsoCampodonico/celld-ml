@@ -1,0 +1,3 @@
+(library
+ (name celld_cell)
+ (libraries celld_ltx))

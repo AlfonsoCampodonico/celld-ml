@@ -1,0 +1,3 @@
+(library
+ (name celld_wire)
+ (libraries celld_logic))

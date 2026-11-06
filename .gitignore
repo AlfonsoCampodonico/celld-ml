@@ -1,0 +1,13 @@
+_build*/
+unikernels/*/_build/
+unikernels/*/duniverse/
+unikernels/*/dist/
+unikernels/*/mirage/
+unikernels/*/Makefile
+unikernels/*/dune
+unikernels/*/dune.build
+unikernels/*/dune.config
+unikernels/*/dune-project
+unikernels/*/dune-workspace
+unikernels/*/lib
+*.img

@@ -1,0 +1,4 @@
+(library
+ (name celld_bucketc)
+ (optional)
+ (libraries celld_http celld_http_mirage lwt tcpip ipaddr mirage-sleep logs))

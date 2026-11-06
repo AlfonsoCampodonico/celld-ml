@@ -1,0 +1,4 @@
+(library
+ (name celld_http_mirage)
+ (optional)
+ (libraries celld_http lwt cstruct tcpip mirage-flow mirage-sleep ipaddr logs))
