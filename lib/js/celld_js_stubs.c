@@ -294,6 +294,10 @@ CAMLprim value celld_js_call(value cv, value name, value req) {
   JS_FreeValue(ctx, fn);
   JS_FreeValue(ctx, g);
   JSContext *failed = NULL;
+  /* The drain gets its own budget: an interrupted call still has to settle
+     its promise through jobs. Total work stays bounded by two budgets plus
+     MAX_JOBS short jobs. */
+  c->budget = CALL_BUDGET;
   if (JS_IsException(p)) {
     char *msg = exception_text(ctx);
     drain(c, &failed);

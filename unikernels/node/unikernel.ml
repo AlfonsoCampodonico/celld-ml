@@ -79,6 +79,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
   (* What this node holds for other leaders, keyed by leader session. *)
   type held = { mutable sealed : bool; entries : (int, Wire.entry) Hashtbl.t }
 
+  type ws = { wconn : H.conn; wlock : Lwt_mutex.t }
+
   type runtime = {
     store : Store.t;
     epoch : int;
@@ -106,6 +108,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
     mutable last_shed_ms : int;
     alarm_timers : (cell_id, int) Hashtbl.t;  (** the alarm each resident cell's timer waits for *)
     pumping : (cell_id, unit) Hashtbl.t;  (** cells whose outbox is being delivered *)
+    tunnels : (string, H.conn list) Hashtbl.t;  (** idle peer tunnels, by peer address *)
+    sockets : (cell_id, (string, ws) Hashtbl.t) Hashtbl.t;  (** WebSockets this node terminates, by cell *)
     held : (string, held) Hashtbl.t;
     disk : D.t;  (** follower log: what [held] is rebuilt from after a restart *)
     disk_lock : Lwt_mutex.t;
@@ -165,23 +169,68 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
       close = (fun () -> Tls_flow.close tls);
     }
 
-  (* Peer requests go over TLS that pins the fleet certificate, and are
-     also HMAC-signed with the fleet secret. *)
-  let peer_call t addr ?(headers = []) ~meth ~path body =
+  (* ---- the peer tunnel (celld's peer_tunnel) ----
+     A TLS connection to a peer, pinned to the fleet certificate, upgraded
+     once with a signed POST /peer/tunnel. After the 101 it carries plain
+     keep-alive HTTP: idle tunnels are pooled per peer and reused for
+     sequential calls, so a call costs no new handshake. A WebSocket takes a
+     tunnel of its own and turns it into a byte relay. Every inner request
+     is still HMAC-signed. *)
+
+  let tls_open t addr =
     let ip, port = parse_addr addr in
-    let headers = sign t ~meth ~path ~body @ headers in
-    let connect () =
-      match t.peer_client with
-      | None -> Lwt.return (Error "fleet TLS identity not loaded")
-      | Some config -> (
-          S.TCP.create_connection (S.tcp t.stack) (ip, port) >>= function
-          | Error e -> Lwt.return (Error (Fmt.str "%a" S.TCP.pp_error e))
-          | Ok flow -> (
-              Tls_flow.client_of_flow config flow >|= function
-              | Ok tls -> Ok (tls_conn tls)
-              | Error e -> Error (Fmt.str "tls: %a" Tls_flow.pp_write_error e)))
-    in
-    H.request_over ~connect ~default_host:addr ~timeout_ns:5_000_000_000L { Celld_http.meth; target = path; headers; body }
+    match t.peer_client with
+    | None -> Lwt.return (Error "fleet TLS identity not loaded")
+    | Some config -> (
+        S.TCP.create_connection (S.tcp t.stack) (ip, port) >>= function
+        | Error e -> Lwt.return (Error (Fmt.str "%a" S.TCP.pp_error e))
+        | Ok flow -> (
+            Tls_flow.client_of_flow config flow >|= function
+            | Ok tls -> Ok (tls_conn tls)
+            | Error e -> Error (Fmt.str "tls: %a" Tls_flow.pp_write_error e)))
+
+  let signed t addr ?(headers = []) ~meth ~path body =
+    { Celld_http.meth; target = path; headers = (("Host", addr) :: sign t ~meth ~path ~body) @ headers; body }
+
+  let tunnel_open t addr =
+    tls_open t addr >>= function
+    | Error e -> Lwt.return (Error e)
+    | Ok conn -> (
+        H.exchange conn ~timeout_ns:5_000_000_000L
+          (signed t addr ~headers:[ ("Upgrade", "celld-tunnel"); ("Connection", "Upgrade") ] ~meth:"POST" ~path:"/peer/tunnel" "")
+        >>= function
+        | Ok ({ status = 101; _ }, _) -> Lwt.return (Ok conn)
+        | Ok (r, _) -> conn.close () >|= fun () -> Error (Printf.sprintf "tunnel refused: %d %s" r.status (String.trim r.body))
+        | Error _ -> conn.close () >|= fun () -> Error "tunnel handshake failed")
+
+  let pool_max = 4
+
+  let take_tunnel t addr =
+    match Hashtbl.find_opt t.tunnels addr with
+    | Some (c :: rest) -> Hashtbl.replace t.tunnels addr rest; Some c
+    | _ -> None
+
+  let give_tunnel t addr conn =
+    let idle = Option.value (Hashtbl.find_opt t.tunnels addr) ~default:[] in
+    if List.length idle < pool_max then Hashtbl.replace t.tunnels addr (conn :: idle)
+    else Lwt.async (fun () -> Lwt.catch conn.H.close (fun _ -> Lwt.return_unit))
+
+  let rec peer_call ?(fresh = false) t addr ?(headers = []) ~meth ~path body =
+    (match if fresh then None else take_tunnel t addr with
+    | Some c -> Lwt.return (Ok (c, true))
+    | None -> tunnel_open t addr >|= Result.map (fun c -> (c, false)))
+    >>= function
+    | Error e -> Lwt.return (Error (`Connect e))
+    | Ok (conn, reused) -> (
+        let drop () = Lwt.async (fun () -> Lwt.catch conn.H.close (fun _ -> Lwt.return_unit)) in
+        H.exchange conn ~timeout_ns:5_000_000_000L (signed t addr ~headers ~meth ~path body) >>= function
+        | Ok (resp, _) -> give_tunnel t addr conn; Lwt.return (Ok resp)
+        (* A pooled tunnel the peer had already closed: the request never
+           reached it, so it is safe to send again on a fresh one. *)
+        | Error `Fresh_eof when reused -> drop (); peer_call ~fresh:true t addr ~headers ~meth ~path body
+        | Error `Fresh_eof -> drop (); Lwt.return (Error (`Io "tunnel closed"))
+        | Error (`Io e) -> drop (); Lwt.return (Error (`Io e))
+        | Error `Timeout -> drop (); Lwt.return (Error `Timeout))
 
   (* ---- durability bookkeeping ---- *)
 
@@ -637,6 +686,17 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
     | Stop_runtime { op; cell; epoch; reset } ->
         Log.info (fun m -> m "stopping %s at e%d%s" cell epoch (if reset then " (reset)" else ""));
         (match Hashtbl.find_opt t.runtimes cell with Some { js = Some js; _ } -> Celld_js.dispose js | _ -> ());
+        (* The cell is leaving this node: its clients reconnect (1012, as
+           celld and Cloudflare do on a move). *)
+        (match Hashtbl.find_opt t.sockets cell with
+        | Some socks ->
+            Hashtbl.remove t.sockets cell;
+            Hashtbl.iter
+              (fun _ w ->
+                Lwt.async (fun () ->
+                    Lwt_mutex.with_lock w.wlock (fun () -> w.wconn.write (Celld_ws.close_frame 1012 "cell moved") >>= fun _ -> w.wconn.close ())))
+              socks
+        | None -> ());
         Hashtbl.remove t.runtimes cell;
         Hashtbl.remove t.alarm_timers cell;
         (* Ensure_durable ran first, so this epoch's files are all in the
@@ -712,6 +772,149 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
           | _ -> Lwt.return_unit)
       | Error _ -> Lwt.return_unit
 
+  (* ---- WebSockets ----
+     The node that owns a cell terminates its sockets; any other node only
+     relays bytes over a tunnel. Each frame from a client is an event
+     through the cell (webSocketMessage), serialized per socket, and what
+     the cell sends back leaves after its writes are durable. *)
+
+  and ws_write t cell id frame =
+    match Option.bind (Hashtbl.find_opt t.sockets cell) (fun s -> Hashtbl.find_opt s id) with
+    | Some w -> Lwt_mutex.with_lock w.wlock (fun () -> w.wconn.write frame >|= ignore)
+    | None -> Lwt.return_unit
+
+  and ws_forget t cell id =
+    match Hashtbl.find_opt t.sockets cell with
+    | Some s -> Hashtbl.remove s id; if Hashtbl.length s = 0 then Hashtbl.remove t.sockets cell
+    | None -> ()
+
+  and apply_effects t cell effects =
+    match Wire.of_string effects with
+    | Error _ -> Lwt.return_unit
+    | Ok j ->
+        let items k = match Wire.field k j with Some (Wire.Arr l) -> l | _ -> [] in
+        Lwt_list.iter_s
+          (fun m ->
+            let id = Wire.str_field "id" m and data = Wire.str_field "data" m in
+            let binary = Wire.field "binary" m = Some (Wire.Bool true) in
+            ws_write t cell id (if binary then Celld_ws.encode Binary (Celld_ws.base64_decode data) else Celld_ws.encode Text data))
+          (items "sends")
+        >>= fun () ->
+        Lwt_list.iter_s
+          (fun m ->
+            let id = Wire.str_field "id" m in
+            let code = match Wire.int_field "code" m with 0 -> 1000 | c -> c in
+            match Option.bind (Hashtbl.find_opt t.sockets cell) (fun s -> Hashtbl.find_opt s id) with
+            | Some w ->
+                ws_forget t cell id;
+                Lwt_mutex.with_lock w.wlock (fun () -> w.wconn.write (Celld_ws.close_frame code (Wire.str_field "reason" m)) >>= fun _ -> w.wconn.close ())
+            | None -> Lwt.return_unit)
+          (items "closes")
+
+  (* One client socket on the owner node. *)
+  and ws_session t cell id conn initial =
+    let socks = match Hashtbl.find_opt t.sockets cell with Some s -> s | None -> let s = Hashtbl.create 4 in Hashtbl.replace t.sockets cell s; s in
+    let w = { wconn = conn; wlock = Lwt_mutex.create () } in
+    Hashtbl.replace socks id w;
+    Log.info (fun m -> m "%s: websocket %s open" cell id);
+    let event path fields =
+      serve_cell t ~forwarded:true cell ~meth:"WS" ~path ~query:[] ~body:(Wire.to_string (Wire.Obj (("id", Wire.Str id) :: fields)))
+    in
+    let finish code reason =
+      let mine = match Option.bind (Hashtbl.find_opt t.sockets cell) (fun s -> Hashtbl.find_opt s id) with Some w' -> w' == w | None -> false in
+      if not mine then Lwt.catch conn.close (fun _ -> Lwt.return_unit)
+      else begin
+        ws_forget t cell id;
+        Log.info (fun m -> m "%s: websocket %s closed (%d)" cell id code);
+        event "/__ws/close" [ ("code", Wire.Int code); ("reason", Wire.Str reason) ] >>= fun _ -> Lwt.catch conn.close (fun _ -> Lwt.return_unit)
+      end
+    in
+    let frag = Buffer.create 256 and frag_binary = ref false in
+    let rec loop buf =
+      match Celld_ws.decode buf with
+      | `Error e ->
+          Lwt_mutex.with_lock w.wlock (fun () -> conn.write (Celld_ws.close_frame 1002 e)) >>= fun _ -> finish 1002 e
+      | `Partial -> (
+          conn.read () >>= function
+          | `Data d -> loop (buf ^ d)
+          | `Eof | `Error _ -> finish 1006 "")
+      | `Frame (f, used) -> (
+          let rest = String.sub buf used (String.length buf - used) in
+          let message binary data =
+            event "/__ws/message" [ ("data", Wire.Str (if binary then Celld_ws.base64 data else data)); ("binary", Wire.Bool binary) ] >>= fun (r : Celld_http.response) ->
+            if r.status = 421 || r.status = 503 then
+              Lwt_mutex.with_lock w.wlock (fun () -> conn.write (Celld_ws.close_frame 1012 "cell moved")) >>= fun _ -> finish 1012 "cell moved"
+            else loop rest
+          in
+          match f.opcode with
+          | (Text | Binary) when f.fin -> message (f.opcode = Binary) f.payload
+          | Text | Binary ->
+              Buffer.clear frag;
+              Buffer.add_string frag f.payload;
+              frag_binary := f.opcode = Binary;
+              loop rest
+          | Continuation ->
+              Buffer.add_string frag f.payload;
+              if Buffer.length frag > 1 lsl 20 then
+                Lwt_mutex.with_lock w.wlock (fun () -> conn.write (Celld_ws.close_frame 1009 "message too big")) >>= fun _ -> finish 1009 ""
+              else if f.fin then message !frag_binary (Buffer.contents frag)
+              else loop rest
+          | Ping -> Lwt_mutex.with_lock w.wlock (fun () -> conn.write (Celld_ws.encode Pong f.payload)) >>= fun _ -> loop rest
+          | Pong | Other _ -> loop rest
+          | Close ->
+              let code, reason = Celld_ws.close_info f.payload in
+              Lwt_mutex.with_lock w.wlock (fun () -> conn.write (Celld_ws.close_frame (if code = 1005 then 1000 else code) "")) >>= fun _ ->
+              finish code reason)
+    in
+    Lwt.catch (fun () -> loop initial) (fun exn -> finish 1011 (Printexc.to_string exn))
+
+  (* A client's upgrade request for [cell]. On the owner: run fetch, and on
+     a 101 that accepted a socket, complete the handshake and keep the
+     connection. Elsewhere: forward the upgrade over a dedicated tunnel and
+     relay bytes both ways. *)
+  and ws_upgrade t ?(forwarded = false) cell ~path ~query ~(headers : (string * string) list) =
+    let key = Option.value (Celld_http.header "sec-websocket-key" headers) ~default:"" in
+    resolve t cell >>= fun (req, route) ->
+    match route with
+    | Error e -> Lwt.return (H.Respond (text 503 (string_of_request_error e ^ "\n")))
+    | Ok (Local epoch) -> (
+        Celld_js.headers := headers;
+        run_local t req cell epoch ~meth:"GET" ~path ~query ~body:"" >|= fun (r : Celld_http.response) ->
+        match r.status, Celld_http.header "x-celld-ws-accept" r.headers with
+        | 101, Some id when key <> "" ->
+            let hs =
+              { Celld_http.status = 101; headers = [ ("Upgrade", "websocket"); ("Connection", "Upgrade"); ("Sec-WebSocket-Accept", Celld_ws.accept_key key) ]; body = "" }
+            in
+            H.Upgrade (hs, fun conn rest -> ws_session t cell id conn rest)
+        | _ -> H.Respond r)
+    | Ok (Remote _) when forwarded -> Lwt.return (H.Respond (text 421 "not the owner\n"))
+    | Ok (Remote peer) -> (
+        let target = path ^ if query = [] then "" else "?" ^ String.concat "&" (List.map (fun (k, v) -> Celld_http.pct_encode k ^ "=" ^ Celld_http.pct_encode v) query) in
+        let pass = List.filter (fun (k, _) -> match String.lowercase_ascii k with "sec-websocket-key" | "sec-websocket-version" | "sec-websocket-protocol" | "origin" -> true | _ -> false) headers in
+        tunnel_open t peer.p_addr >>= function
+        | Error e -> Lwt.return (H.Respond (text 502 ("owner unreachable: " ^ e ^ "\n")))
+        | Ok tun -> (
+            H.exchange tun ~timeout_ns:10_000_000_000L
+              (signed t peer.p_addr ~meth:"POST" ~path:"/peer/forward"
+                 ~headers:([ ("x-cells-scope", cell); ("x-cells-method", "GET"); ("x-cells-path", target); ("x-cells-upgrade", "websocket") ] @ pass)
+                 "")
+            >>= function
+            | Ok (({ status = 101; _ } as hs), tun_rest) ->
+                Lwt.return (H.Upgrade (hs, fun client client_rest -> relay client client_rest tun tun_rest))
+            | Ok (r, _) -> tun.close () >|= fun () -> H.Respond r
+            | Error _ -> tun.close () >|= fun () -> H.Respond (text 502 "owner did not accept the upgrade\n")))
+
+  and relay (a : H.conn) a_rest (b : H.conn) b_rest =
+    let close_both () = Lwt.catch a.close (fun _ -> Lwt.return_unit) >>= fun () -> Lwt.catch b.close (fun _ -> Lwt.return_unit) in
+    let rec pump (src : H.conn) (dst : H.conn) =
+      src.read () >>= function
+      | `Data d -> ( dst.write d >>= function Ok () -> pump src dst | Error _ -> close_both ())
+      | `Eof | `Error _ -> close_both ()
+    in
+    (if b_rest <> "" then a.write b_rest >|= ignore else Lwt.return_unit) >>= fun () ->
+    (if a_rest <> "" then b.write a_rest >|= ignore else Lwt.return_unit) >>= fun () ->
+    Lwt.join [ pump a b; pump b a ]
+
   (* Deliver a cell's outbox to the queues it names, then acknowledge it in
      the cell. Runs after a durable write, and from the periodic loop. *)
   and pump_outbox t cell =
@@ -786,7 +989,10 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         let alarm_before = Handlers.alarm_of rt.store in
         let now = now_ms () in
         Celld_sqlite.set_now (Int64.of_int now);
+        Celld_js.sockets := (match Hashtbl.find_opt t.sockets cell with Some s -> Hashtbl.fold (fun id _ acc -> id :: acc) s [] | None -> []);
         let reply = handler rt.store ~now_ms:now ~meth ~path ~query ~body in
+        Celld_js.headers := [];
+        Celld_js.sockets := [];
         (* A call that left promise jobs behind poisons its context. *)
         (match rt.js, rt.store.sql with
         | Some js, Some db when Celld_js.poisoned js -> (
@@ -817,11 +1023,18 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         (* The output gate: nothing leaves until the core releases it. *)
         p >|= (function
         | Ok () ->
-            (* the write is durable: its outbox may go out *)
+            (* the write is durable: its outbox may go out, and its socket
+               sends may leave *)
             if reply.wrote && rt.store.sql <> None then Lwt.async (fun () -> pump_outbox t cell);
+            if reply.effects <> "" then Lwt.async (fun () -> apply_effects t cell reply.effects);
+            let accept =
+              match Wire.of_string reply.effects with
+              | Ok j -> ( match Wire.field "accept" j with Some (Wire.Arr (Wire.Str id :: _)) -> [ ("x-celld-ws-accept", id) ] | _ -> [])
+              | Error _ -> []
+            in
             {
               Celld_http.status = reply.status;
-              headers = [ ("content-type", reply.content_type); ("x-celld-node", t.me); ("x-celld-epoch", string_of_int epoch) ];
+              headers = [ ("content-type", reply.content_type); ("x-celld-node", t.me); ("x-celld-epoch", string_of_int epoch) ] @ accept;
               body = reply.body;
             }
         | Error e -> text 503 ("write not acknowledged: " ^ string_of_request_error e ^ "\n"))
@@ -847,7 +1060,9 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
             (* NotOwner / NeverConnected: re-resolve once. *)
             push t (Invalidate_remote cell);
             serve_cell t ~retried:true cell ~meth ~path ~query ~body
-        | Ok r -> Lwt.return { r with headers = List.filter (fun (k, _) -> String.length k > 7 && String.sub (String.lowercase_ascii k) 0 7 = "x-celld") r.headers }
+        | Ok r ->
+            Lwt.return
+              { r with headers = List.filter (fun (k, _) -> let k = String.lowercase_ascii k in k = "content-type" || (String.length k > 7 && String.sub k 0 7 = "x-celld")) r.headers }
         | Error (`Connect e) -> Lwt.return (text 502 ("owner unreachable: " ^ e ^ "\n"))
         | Error (`Io _ | `Timeout) ->
             (* Ambiguous: the owner may have run it. Never re-send. *)
@@ -1007,6 +1222,40 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         | _ -> Lwt.return (text 404 "unknown peer endpoint\n"))
 
   (* The fleet secret: created once, conditionally, by whichever node is first. *)
+  let is_ws_upgrade (r : Celld_http.request) =
+    r.meth = "GET"
+    && (match Celld_http.header "upgrade" r.headers with Some v -> String.lowercase_ascii (String.trim v) = "websocket" | None -> false)
+
+  (* The peer port: a signed /peer/tunnel upgrade turns the connection into
+     a tunnel serving the same endpoints; a forwarded WebSocket upgrade
+     hands the tunnel to the socket. Everything else is [internal]. *)
+  let rec internal_ext t (r : Celld_http.request) =
+    match r.meth, fst (Celld_http.path_and_query r.target) with
+    | "POST", "/peer/tunnel" -> (
+        match verify t r with
+        | Error e -> Lwt.return (H.Respond (text 401 (e ^ "\n")))
+        | Ok _ ->
+            let hs = { Celld_http.status = 101; headers = [ ("Upgrade", "celld-tunnel"); ("Connection", "Upgrade") ]; body = "" } in
+            Lwt.return (H.Upgrade (hs, fun conn rest -> H.handle_conn_ext ~initial:rest (internal_ext t) conn)))
+    | "POST", "/peer/forward" when Celld_http.header "x-cells-upgrade" r.headers = Some "websocket" -> (
+        match verify t r with
+        | Error e -> Lwt.return (H.Respond (text 401 (e ^ "\n")))
+        | Ok _ -> (
+            match Celld_http.header "x-cells-scope" r.headers, Celld_http.header "x-cells-path" r.headers with
+            | Some cell, Some target when Handlers.valid_cell cell && Handlers.is_js cell ->
+                let path, query = Celld_http.path_and_query target in
+                ws_upgrade t ~forwarded:true cell ~path ~query ~headers:(("upgrade", "websocket") :: r.headers)
+            | _ -> Lwt.return (H.Respond (text 400 "bad websocket forward\n"))))
+    | _ -> internal t r >|= fun x -> H.Respond x
+
+  (* The public port: WebSocket upgrades for JS cells, else [public]. *)
+  let public_ext t (r : Celld_http.request) =
+    match cell_of_target r.target with
+    | Some (cell, path, query) when is_ws_upgrade r && Handlers.valid_cell cell && Handlers.is_js cell
+                                    && not (String.length path > 2 && String.sub path 0 3 = "/__") ->
+        ws_upgrade t cell ~path ~query ~headers:r.headers
+    | _ -> public t r >|= fun x -> H.Respond x
+
   (* The fleet TLS identity: a P-256 key and a self-signed certificate,
      created once, conditionally, by whichever node is first, like the fleet
      secret. Anyone who can read the bucket can already impersonate the
@@ -1047,7 +1296,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
   let serve_tls stack ~port config handler =
     S.TCP.listen (S.tcp stack) ~port (fun flow ->
         Tls_flow.server_of_flow config flow >>= function
-        | Ok tls -> H.handle_conn handler (tls_conn tls)
+        | Ok tls -> H.handle_conn_ext handler (tls_conn tls)
         | Error e ->
             Log.debug (fun m -> m "peer TLS handshake failed: %a" Tls_flow.pp_write_error e);
             S.TCP.close flow)
@@ -1132,6 +1381,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         last_shed_ms = 0;
         alarm_timers = Hashtbl.create 16;
         pumping = Hashtbl.create 16;
+        tunnels = Hashtbl.create 8;
+        sockets = Hashtbl.create 16;
         held = Hashtbl.create 4;
         disk;
         disk_lock = Lwt_mutex.create ();
@@ -1157,8 +1408,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
     let fingerprint = X509.Certificate.fingerprint `SHA256 cert in
     let authenticator = X509.Authenticator.cert_fingerprint ~time:(fun () -> Some (Mirage_ptime.now ())) ~hash:`SHA256 ~fingerprint in
     t.peer_client <- (match Tls.Config.client ~authenticator () with Ok c -> Some c | Error (`Msg e) -> failwith ("peer TLS client: " ^ e));
-    serve_tls stack ~port:internal_port server (internal t);
-    H.serve stack ~port:public_port (public t);
+    serve_tls stack ~port:internal_port server (internal_ext t);
+    S.TCP.listen (S.tcp stack) ~port:public_port (fun flow -> H.handle_conn_ext (public_ext t) (H.tcp_conn flow));
     Lwt.async (fun () -> actor t stream);
     t.mailbox Start_node;
     Lwt.async (fun () ->
@@ -1168,6 +1419,10 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
           rebalance_once t;
           scan_alarms t >>= fun () ->
           Hashtbl.iter (fun cell rt -> if rt.store.sql <> None then Lwt.async (fun () -> pump_outbox t cell)) t.runtimes;
+          (* A cell with open sockets is in use, whether or not they talk. *)
+          Hashtbl.iter
+            (fun cell _ -> Lwt.async (fun () -> serve_cell t ~forwarded:true cell ~meth:"WS" ~path:"/__ws/touch" ~query:[] ~body:"" >|= ignore))
+            t.sockets;
           sleep_ms 2_000 >>= loop
         in
         sleep_ms 500 >>= loop);

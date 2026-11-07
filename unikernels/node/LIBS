@@ -3,6 +3,7 @@ celld_ltx
 celld_sqlite
 celld_js
 celld_cron
+celld_ws
 celld_cell
 celld_wire
 celld_http

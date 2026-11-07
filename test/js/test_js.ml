@@ -46,7 +46,7 @@ let () =
     if (r.path === "/json") return String(JSON.parse(r.query.s).length);
     return "b"; }|} in
   let call t ?(query = []) path = Celld_js.call t ~name:"fetch" ~cell:"X:1" ~meth:"GET" ~path ~query ~body:"" in
-  check "cells keep separate globals" (call a "/" = Ok { status = 200; content_type = "text/plain"; body = "1" } && (match call b "/" with Ok r -> r.body = "b" | _ -> false));
+  check "cells keep separate globals" (call a "/" = Ok { status = 200; content_type = "text/plain"; body = "1"; effects = "" } && (match call b "/" with Ok r -> r.body = "b" | _ -> false));
   (match call b "/deep" with Error e -> check ("deep recursion is an error: " ^ String.sub e 0 (min 40 (String.length e))) true | Ok _ -> check "deep recursion" false);
   (match call b "/hog" with Error _ -> check "memory limit is per cell" true | Ok _ -> check "memory limit" false);
   check "other cell unaffected by a hog" (match call a "/" with Ok r -> r.body = "2" | _ -> false);
@@ -70,3 +70,42 @@ let () =
   check "context is poisoned" (Celld_js.poisoned t);
   (match call () with Error e -> check "poisoned context refuses calls" (String.sub e 0 8 = "poisoned") | Ok _ -> check "poisoned" false);
   Celld_js.dispose t
+
+(* WebSockets: accept in fetch, broadcast on a message, clean up on close. *)
+let () =
+  let db = Celld_sqlite.open_image "" in
+  let t =
+    match
+      Celld_js.create ~db
+        ~script:
+          {|function fetch(request, ctx) {
+              if (request.headers.upgrade !== "websocket") return new Response("expected a websocket", { status: 426 });
+              const [client, server] = Object.values(new WebSocketPair());
+              ctx.acceptWebSocket(server, ["room"]);
+              server.serializeAttachment({ joined: 1 });
+              return new Response(null, { status: 101, webSocket: client });
+            }
+            function webSocketMessage(ws, msg, ctx) {
+              for (const peer of ctx.getWebSockets("room")) peer.send("echo:" + msg + ":" + ws.deserializeAttachment().joined);
+            }
+            function webSocketClose(ws, code, reason, clean, ctx) { ctx.storage.put("closed", code); }|}
+    with
+    | Ok t -> t
+    | Error e -> failwith e
+  in
+  Celld_js.headers := [ ("Upgrade", "websocket") ];
+  let r = Celld_js.call t ~name:"fetch" ~cell:"Room:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" in
+  Celld_js.headers := [];
+  match r with
+  | Error e -> check ("upgrade: " ^ e) false
+  | Ok r ->
+      check "fetch accepts a socket with a 101" (r.status = 101 && String.length r.effects > 0 && String.sub r.effects 0 11 = {|{"accept":[|});
+      let id = String.sub r.effects 12 24 in
+      Celld_js.sockets := [ id ];
+      (match Celld_js.call t ~name:"ws_message" ~cell:"Room:1" ~meth:"" ~path:"" ~query:[] ~body:(Printf.sprintf {|{"id":%S,"data":"hi","binary":false}|} id) with
+      | Ok m -> check "a message is broadcast to tagged sockets" (m.effects = Printf.sprintf {|{"accept":[],"sends":[{"id":%S,"data":"echo:hi:1","binary":false}],"closes":[]}|} id)
+      | Error e -> check e false);
+      (match Celld_js.call t ~name:"ws_close" ~cell:"Room:1" ~meth:"" ~path:"" ~query:[] ~body:(Printf.sprintf {|{"id":%S,"code":1000,"reason":""}|} id) with
+      | Ok _ -> check "close runs webSocketClose" true
+      | Error e -> check e false);
+      Celld_js.sockets := []

@@ -222,6 +222,22 @@ claim its cells.
   The certificate is checked against the Mozilla root store, or pinned
   with `--s3-tls-fingerprint`. The unikernel has no DNS, so the endpoint is
   an IP and `--s3-host` sets the Host header and TLS name.
+- **WebSockets.** A JS cell accepts sockets with the Durable Object
+  hibernation API: `new WebSocketPair()`, `ctx.acceptWebSocket(server, tags)`,
+  `ctx.getWebSockets(tag)`, `ws.send()`, `ws.close()` and
+  `serializeAttachment`. Its `webSocketMessage(ws, message, ctx)` and
+  `webSocketClose(ws, code, reason, wasClean, ctx)` run as ordinary events
+  through the cell, one at a time per socket. Sends leave only after the
+  event's writes are durable. The owner node terminates the socket, and a
+  client that reached another node is relayed byte for byte over a tunnel.
+  Open sockets keep their cell resident. When the cell moves (drain or
+  rebalance), the sockets close with 1012 so clients reconnect, as in celld.
+  [examples/room.js](examples/room.js).
+- **The peer tunnel.** Peer calls travel through a pooled TLS connection to
+  each peer, upgraded once with a signed `POST /peer/tunnel`. After that it
+  carries keep-alive HTTP, so a forwarded request costs no new handshake. A
+  pooled tunnel the peer closed while idle is retried on a fresh one, since
+  the request never reached it.
 - **Encrypted, signed peer traffic.** The peer port (8081) speaks TLS 1.3
   with a fleet identity: the first node creates a P-256 key and a
   self-signed certificate in `fleet/peer-tls.json` with a conditional write,
@@ -231,7 +247,10 @@ claim its cells.
   bucket stays the root of trust. The protocol version is 6, so nodes
   without peer TLS are not recruited.
 
-The fork leaves out WebSockets and the tunnel. A forwarded request is one signed POST.
+Compared with celld, celld-ml still lacks outbound `fetch()` from cells,
+most of the Workers API surface (Web Crypto, streams, `waitUntil`, service
+bindings, D1, R2, Workflows), rolling deploys that move resident cells to
+new code, and memory-pressure shedding.
 
 ## Layout
 
@@ -240,6 +259,7 @@ The fork leaves out WebSockets and the tunnel. A forwarded request is one signed
 | `lib/logic` | the core: types, phases, `on_event` |
 | `lib/ltx` | the LTX format, CRC-64, and an LZ4 block codec written from the format spec |
 | `lib/cell` | the page store (KV or SQLite), capture, restore planning, GC, and the cell classes |
+| `lib/ws` | WebSocket handshake and frames (RFC 6455), checked against the RFC's examples |
 | `lib/cron` | Cloudflare-dialect cron expressions: parsing, next occurrence, catch-up |
 | `lib/s3` | SigV4 signing (checked against AWS's published examples), key encoding, ListObjectsV2 parsing |
 | `lib/js` | the JS cell runtime over QuickJS 2026-06-04 (fetched by `scripts/fetch-vendor.sh`): the Solo5 shims it needs, prelude, storage binding, budgets |
@@ -257,7 +277,7 @@ Everything runs inside a Lima VM, because Solo5 needs Linux and KVM. On an
 M3 or newer Mac, nested virtualization provides `/dev/kvm`.
 
 ```bash
-limactl create --name=mirage --vm-type=vz --cpus=6 --memory=8 --set='.nestedVirtualization=true | .mounts=[{"location":"~/Github/Personal/celld-ml","writable":true}]' template:ubuntu
+limactl create --name=mirage --vm-type=vz --cpus=6 --memory=4 --set='.nestedVirtualization=true | .mounts=[{"location":"~/Github/Personal/celld-ml","writable":true}]' template:ubuntu
 ```
 
 Inside the VM, install opam, an OCaml 5.3 switch named `mirage`, and the
@@ -336,6 +356,11 @@ dune build @runtest --root . --build-dir _build_all
 - **Peer TLS:** a packet capture of a forwarded write showed 358 packets
   of TLS records on port 8081 and none of the request's plaintext, and a
   takeover recovered the dead owner's log over TLS.
+- **WebSockets:** two clients joined a room through n1 and n2 while n3 owned
+  it, so both were relayed over tunnels. Messages reached both, ping and
+  close were answered, and draining n3 closed the remaining socket with
+  1012. The room's history, written by socket events, was intact on the
+  node that took over.
 - **Queues and cron:** 7 orders from three nodes reached the consumer in
   batches of 5 and 2. An order whose handler threw was tried 3 times
   (`max_retries` 2) and moved to the dead-letter queue. The heartbeat cron

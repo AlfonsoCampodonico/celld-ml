@@ -13,6 +13,22 @@ module Make (S : Tcpip.Stack.V4V6) : sig
   val handle_conn : (Celld_http.request -> Celld_http.response Lwt.t) -> conn -> unit Lwt.t
   (** The server loop of {!serve} on one connection. *)
 
+  type reply = Respond of Celld_http.response | Upgrade of Celld_http.response * (conn -> string -> unit Lwt.t)
+
+  val handle_conn_ext : ?initial:string -> (Celld_http.request -> reply Lwt.t) -> conn -> unit Lwt.t
+  (** Like {!handle_conn}, but an [Upgrade] reply writes its response and
+      hands the connection, with any bytes already read, to its function.
+      [initial] is input that arrived before this loop took over. *)
+
+  val exchange :
+    conn ->
+    ?timeout_ns:int64 ->
+    Celld_http.request ->
+    (Celld_http.response * string, [ `Fresh_eof | `Io of string | `Timeout ]) result Lwt.t
+  (** One request on an open connection, kept open. Returns the response and
+      any bytes past it. [`Fresh_eof]: the peer closed the connection before
+      a byte of response. *)
+
   val serve :
     S.t -> port:int -> (Celld_http.request -> Celld_http.response Lwt.t) -> unit
   (** Listens on [port]. Each connection runs a keep-alive loop that handles

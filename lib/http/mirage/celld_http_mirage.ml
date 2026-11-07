@@ -39,9 +39,15 @@ module Make (S : Tcpip.Stack.V4V6) = struct
       close = (fun () -> T.close flow);
     }
 
+  (* A handler either answers, or answers and takes the connection over
+     (a 101 Switching Protocols), receiving any bytes already read past the
+     request. *)
+  type reply = Respond of Celld_http.response | Upgrade of Celld_http.response * (conn -> string -> unit Lwt.t)
+
   (* Per-connection loop. [buf] holds bytes received but not yet consumed. *)
-  let handle_conn handler conn =
+  let handle_conn_ext ?(initial = "") handler conn =
     let buf = Buffer.create 4096 in
+    Buffer.add_string buf initial;
     (* Minimum buffer length before it is worth re-parsing. *)
     let need = ref 0 in
     let close () = conn.close () in
@@ -59,8 +65,16 @@ module Make (S : Tcpip.Stack.V4V6) = struct
             (fun () -> handler req)
             (fun exn ->
               Log.err (fun m -> m "handler raised: %s" (Printexc.to_string exn));
-              Lwt.return (internal_error (Printexc.to_string exn)))
-          >>= fun resp ->
+              Lwt.return (Respond (internal_error (Printexc.to_string exn))))
+          >>= ( function
+          | Upgrade (resp, take) -> (
+              conn.write (Celld_http.serialize_response resp) >>= function
+              | Error e -> Log.debug (fun m -> m "write failed: %s" e); close ()
+              | Ok () ->
+                  let rest = Buffer.contents buf in
+                  Buffer.clear buf;
+                  take conn rest)
+          | Respond resp ->
           let closing = wants_close req in
           let resp =
             if closing then
@@ -71,7 +85,7 @@ module Make (S : Tcpip.Stack.V4V6) = struct
           | Error e ->
               Log.debug (fun m -> m "write failed: %s" e);
               close ()
-          | Ok () -> if closing then close () else loop () )
+          | Ok () -> if closing then close () else loop () ) )
       | Celld_http.Error e ->
           Log.debug (fun m -> m "bad request: %s" e);
           let resp =
@@ -96,6 +110,41 @@ module Make (S : Tcpip.Stack.V4V6) = struct
     Lwt.catch loop (fun exn ->
         Log.err (fun m -> m "connection loop raised: %s" (Printexc.to_string exn));
         close ())
+
+  let handle_conn handler conn = handle_conn_ext (fun r -> handler r >|= fun x -> Respond x) conn
+
+  (* One request on an open connection that stays open (keep-alive). Returns
+     the response and any bytes read past it. [`Fresh_eof] is an EOF before
+     a single response byte: on a pooled connection, the peer closed it while
+     idle and never saw the request. *)
+  let exchange conn ?(timeout_ns = 10_000_000_000L) (req : Celld_http.request) =
+    let is_head = String.uppercase_ascii req.meth = "HEAD" in
+    let req = { req with headers = List.filter (fun (k, _) -> String.lowercase_ascii k <> "connection") req.headers } in
+    let go () =
+      conn.write (Celld_http.serialize_request req) >>= function
+      | Error e -> Lwt.return (Error (`Io ("write: " ^ e)))
+      | Ok () ->
+          let buf = Buffer.create 4096 in
+          let need = ref 0 in
+          let rec read_loop () =
+            if Buffer.length buf = 0 || Buffer.length buf < !need then read_more ()
+            else
+              let contents = Buffer.contents buf in
+              match Celld_http.parse_response ~head:is_head contents with
+              | Celld_http.Done (resp, used) -> Lwt.return (Ok (resp, String.sub contents used (String.length contents - used)))
+              | Celld_http.Error e -> Lwt.return (Error (`Io ("parse: " ^ e)))
+              | Celld_http.Partial ->
+                  if not is_head then (match Celld_http.expected_length contents with Some n -> need := n | None -> need := 0);
+                  read_more ()
+          and read_more () =
+            conn.read () >>= function
+            | `Data d -> Buffer.add_string buf d; read_loop ()
+            | `Eof -> Lwt.return (Error (if Buffer.length buf = 0 then `Fresh_eof else `Io "eof before complete response"))
+            | `Error e -> Lwt.return (Error (`Io ("read: " ^ e)))
+          in
+          read_loop ()
+    in
+    Lwt.pick [ go (); (Mirage_sleep.ns timeout_ns >|= fun () -> Error `Timeout) ]
 
   let serve s ~port handler = T.listen (S.tcp s) ~port (fun flow -> handle_conn handler (tcp_conn flow))
 

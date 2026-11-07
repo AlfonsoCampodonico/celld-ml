@@ -212,6 +212,7 @@ let parse_response_eof ?head buf = parse_response_gen ~eof:true ?head buf
 
 let reason = function
   | 100 -> "Continue"
+  | 101 -> "Switching Protocols"
   | 200 -> "OK"
   | 201 -> "Created"
   | 202 -> "Accepted"

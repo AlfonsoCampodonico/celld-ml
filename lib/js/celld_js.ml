@@ -26,6 +26,7 @@ globalThis.Response = class Response {
     init = init || {};
     this.body = body == null ? "" : String(body);
     this.status = init.status || 200;
+    this.webSocket = init.webSocket || null;
     this.headers = init.headers || {};
   }
   async text() { return this.body; }
@@ -34,6 +35,54 @@ globalThis.Response = class Response {
     init = init || {};
     const headers = Object.assign({ "content-type": "application/json" }, init.headers || {});
     return new Response(JSON.stringify(value), { status: init.status, headers });
+  }
+};
+// ---- WebSockets (the Durable Object hibernation API) ----
+// Sockets live in the node; a cell sees them by id. Each call starts from
+// the ids the node reports open and returns what to send and close, which
+// the node applies once the call's writes are durable.
+const __celld_ws = { open: new Set(), accepted: [], sends: [], closes: [] };
+const __b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const __to_b64 = (bytes) => {
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const v = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0);
+    out += __b64[(v >> 18) & 63] + __b64[(v >> 12) & 63] + (i + 1 < bytes.length ? __b64[(v >> 6) & 63] : "=") + (i + 2 < bytes.length ? __b64[v & 63] : "=");
+  }
+  return out;
+};
+const __from_b64 = (s) => {
+  const clean = s.replace(/=+$/, "");
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let o = 0;
+  for (let i = 0; i < clean.length; i += 4) {
+    const v = (__b64.indexOf(clean[i]) << 18) | (__b64.indexOf(clean[i + 1]) << 12) | ((__b64.indexOf(clean[i + 2] || "A") & 63) << 6) | (__b64.indexOf(clean[i + 3] || "A") & 63);
+    if (o < out.length) out[o++] = (v >> 16) & 255;
+    if (o < out.length) out[o++] = (v >> 8) & 255;
+    if (o < out.length) out[o++] = v & 255;
+  }
+  return out.buffer;
+};
+const __ws_table = () => __celld_sql_exec("CREATE TABLE IF NOT EXISTS __celld_ws(id TEXT PRIMARY KEY, tags TEXT NOT NULL, attachment TEXT)", []);
+class __CelldWebSocket {
+  constructor(id) { this.id = id; this.readyState = __celld_ws.open.has(id) ? 1 : 0; }
+  send(data) {
+    if (typeof data === "string") __celld_ws.sends.push({ id: this.id, data, binary: false });
+    else __celld_ws.sends.push({ id: this.id, data: __to_b64(new Uint8Array(data.buffer ? data.buffer : data)), binary: true });
+  }
+  close(code, reason) { __celld_ws.closes.push({ id: this.id, code: code || 1000, reason: reason || "" }); this.readyState = 3; }
+  serializeAttachment(value) { __ws_table(); __celld_sql_exec("UPDATE __celld_ws SET attachment = ? WHERE id = ?", [JSON.stringify(value), this.id]); }
+  deserializeAttachment() {
+    __ws_table();
+    const r = __celld_sql_exec("SELECT attachment FROM __celld_ws WHERE id = ?", [this.id]);
+    return r.length && r[0].attachment != null ? JSON.parse(r[0].attachment) : null;
+  }
+}
+globalThis.WebSocketPair = class WebSocketPair {
+  constructor() {
+    const id = __celld_sql_exec("SELECT lower(hex(randomblob(12))) AS id", [])[0].id;
+    this[0] = new __CelldWebSocket(id);
+    this[1] = new __CelldWebSocket(id);
   }
 };
 const __celld_outbox = (queue, messages) => {
@@ -59,6 +108,19 @@ const __celld_kv = () => {
   __celld_sql_exec("CREATE TABLE IF NOT EXISTS __celld_kv(k TEXT PRIMARY KEY, v TEXT NOT NULL)");
 };
 const __celld_ctx = {
+  acceptWebSocket(ws, tags) {
+    __ws_table();
+    __celld_sql_exec("INSERT OR REPLACE INTO __celld_ws(id, tags) VALUES (?, ?)", [ws.id, JSON.stringify(tags || [])]);
+    __celld_ws.accepted.push(ws.id);
+    __celld_ws.open.add(ws.id);
+    ws.readyState = 1;
+  },
+  getWebSockets(tag) {
+    __ws_table();
+    const tagged = tag === undefined ? null : new Set(__celld_sql_exec("SELECT __celld_ws.id AS id FROM __celld_ws, json_each(__celld_ws.tags) WHERE json_each.value = ?", [tag]).map((r) => r.id));
+    return [...__celld_ws.open].filter((id) => !tagged || tagged.has(id)).map((id) => new __CelldWebSocket(id));
+  },
+  getTags(ws) { __ws_table(); const r = __celld_sql_exec("SELECT tags FROM __celld_ws WHERE id = ?", [ws.id]); return r.length ? JSON.parse(r[0].tags) : []; },
   // Messages go to this cell's outbox in the same commit as the rest of the
   // request, and reach the queue once that commit is durable.
   queue: (name) => ({
@@ -88,9 +150,36 @@ const __celld_ctx = {
     },
   },
 };
+const __ws_ops = () => {
+  const w = __celld_ws;
+  return w.accepted.length || w.sends.length || w.closes.length ? JSON.stringify({ accept: w.accepted, sends: w.sends, closes: w.closes }) : "";
+};
 globalThis.__celld_dispatch = async (name, input) => {
+  const out = await __celld_dispatch_inner(name, input);
+  // status, content type, socket effects, body
+  const nl = out.indexOf("\n"), nl2 = out.indexOf("\n", nl + 1);
+  return out.slice(0, nl2 + 1) + __ws_ops() + "\n" + out.slice(nl2 + 1);
+};
+const __celld_dispatch_inner = async (name, input) => {
   const r = JSON.parse(input);
   __celld_ctx.id = r.cell;
+  __celld_ws.open = new Set(r.sockets || []);
+  __celld_ws.accepted = []; __celld_ws.sends = []; __celld_ws.closes = [];
+  if (name === "ws_message" || name === "ws_close") {
+    const ev = JSON.parse(r.body);
+    const handlers = globalThis.default || globalThis;
+    const ws = new __CelldWebSocket(ev.id);
+    if (name === "ws_close") {
+      __celld_ws.open.delete(ev.id);
+      __ws_table();
+      // The handler may still read the socket's attachment and tags.
+      if (typeof handlers.webSocketClose === "function") await handlers.webSocketClose(ws, ev.code, ev.reason, ev.code !== 1006, __celld_ctx);
+      __celld_sql_exec("DELETE FROM __celld_ws WHERE id = ?", [ev.id]);
+    } else if (typeof handlers.webSocketMessage === "function") {
+      await handlers.webSocketMessage(ws, ev.binary ? __from_b64(ev.data) : ev.data, __celld_ctx);
+    }
+    return "200\ntext/plain\n";
+  }
   const handlers = globalThis.default || globalThis;
   const h = handlers[name];
   if (typeof h !== "function")
@@ -146,13 +235,14 @@ globalThis.__celld_dispatch = async (name, input) => {
       url: "http://" + r.cell + r.path + (qs ? "?" + qs : ""),
       path: r.path,
       query: r.query,
-      headers: {},
+      headers: r.headers || {},
       text: async () => r.body,
       json: async () => JSON.parse(r.body),
     };
     out = await h.call(handlers, request, __celld_ctx);
   }
   if (!(out instanceof Response)) out = typeof out === "string" ? new Response(out) : Response.json(out === undefined ? null : out);
+  if (out.status === 101 && !__celld_ws.accepted.length) return "500\ntext/plain\na 101 response needs ctx.acceptWebSocket(server) first\n";
   const type = out.headers["content-type"] || out.headers["Content-Type"] || "text/plain";
   return out.status + "\n" + type + "\n" + out.body;
 };
@@ -160,7 +250,12 @@ globalThis.__celld_dispatch = async (name, input) => {
 
 let create ~script ~db = create_raw prelude script db
 
-type response = { status : int; content_type : string; body : string }
+type response = { status : int; content_type : string; body : string; effects : string  (** socket operations, JSON, or "" *) }
+
+(* Open socket ids of the cell being called, set by the node before each
+   call (calls are serial). *)
+let sockets : string list ref = ref []
+let headers : (string * string) list ref = ref []
 
 let json_str s =
   let b = Buffer.create (String.length s + 2) in
@@ -177,15 +272,18 @@ let json_str s =
 
 let call t ~name ~cell ~meth ~path ~query ~body =
   let q = String.concat "," (List.map (fun (k, v) -> json_str k ^ ":" ^ json_str v) query) in
+  let socks = String.concat "," (List.map json_str !sockets) in
+  let hdrs = String.concat "," (List.map (fun (k, v) -> json_str (String.lowercase_ascii k) ^ ":" ^ json_str v) !headers) in
   let input =
-    Printf.sprintf "{\"cell\":%s,\"method\":%s,\"path\":%s,\"query\":{%s},\"body\":%s}" (json_str cell) (json_str meth) (json_str path) q (json_str body)
+    Printf.sprintf "{\"cell\":%s,\"method\":%s,\"path\":%s,\"query\":{%s},\"headers\":{%s},\"sockets\":[%s],\"body\":%s}" (json_str cell)
+      (json_str meth) (json_str path) q hdrs socks (json_str body)
   in
   match call_raw t name input with
   | Error e -> Error e
   | Ok out -> (
       match String.split_on_char '\n' out with
-      | status :: content_type :: _ ->
-          let skip = String.length status + String.length content_type + 2 in
+      | status :: content_type :: effects :: _ ->
+          let skip = String.length status + String.length content_type + String.length effects + 3 in
           let body = if skip <= String.length out then String.sub out skip (String.length out - skip) else "" in
-          Ok { status = Option.value (int_of_string_opt status) ~default:500; content_type; body }
+          Ok { status = Option.value (int_of_string_opt status) ~default:500; content_type; body; effects }
       | _ -> Error "malformed handler result")

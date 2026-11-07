@@ -4,10 +4,10 @@
 
 module M = Store.M
 
-type reply = { status : int; body : string; wrote : bool; content_type : string }
+type reply = { status : int; body : string; wrote : bool; content_type : string; effects : string  (** socket operations for the node *) }
 
-let ok ?(wrote = false) body = { status = 200; body; wrote; content_type = "text/plain" }
-let err status body = { status; body; wrote = false; content_type = "text/plain" }
+let ok ?(wrote = false) body = { status = 200; body; wrote; content_type = "text/plain"; effects = "" }
+let err status body = { status; body; wrote = false; content_type = "text/plain"; effects = "" }
 
 let int_of k kv = match M.find_opt k kv with Some v -> int_of_string_opt v |> Option.value ~default:0 | None -> 0
 
@@ -131,7 +131,7 @@ let sql (s : Store.t) ~meth ~path ~query:_ ~body =
         else
           match r with
           | Error e -> err 400 (e ^ "\n")
-          | Ok rs -> { status = 200; body = json_result rs; wrote = Store.changed s; content_type = "application/json" }
+          | Ok rs -> { status = 200; body = json_result rs; wrote = Store.changed s; content_type = "application/json"; effects = "" }
       in
       match meth, path with
       | "POST", "/query" -> run body
@@ -245,7 +245,7 @@ let queue_stats s ~now_ms =
 
 let queue_cell cell : handler =
   let name = match String.index_opt cell ':' with Some i -> String.sub cell (i + 1) (String.length cell - i - 1) | None -> cell in
-  let json_reply s body = { status = 200; body = body ^ "\n"; wrote = Store.changed s; content_type = "application/json" } in
+  let json_reply s body = { status = 200; body = body ^ "\n"; wrote = Store.changed s; content_type = "application/json"; effects = "" } in
   let on_alarm s ~now_ms =
     queue_schema s;
     run s (Printf.sprintf "DELETE FROM q_messages WHERE created_at < %d" (now_ms - retention_ms));
@@ -408,7 +408,7 @@ let guarded s f =
       match f () with
       | Ok (r : Celld_js.response) when r.status >= 500 -> Error r
       | Ok r -> Ok r
-      | Error e -> Error { Celld_js.status = 500; content_type = "text/plain"; body = e })
+      | Error e -> Error { Celld_js.status = 500; content_type = "text/plain"; body = e; effects = "" })
 
 let js (rt : Celld_js.t) cell : handler =
   let call ~name body = Celld_js.call rt ~name ~cell ~meth:"" ~path:"" ~query:[] ~body in
@@ -462,11 +462,17 @@ let js (rt : Celld_js.t) cell : handler =
              List.iter (fun e -> if meta_int s ("cron_last:" ^ e) = None then Store.meta_set s ("cron_last:" ^ e) (string_of_int now_ms)) exprs;
              cron_reschedule s ~now_ms;
              { (ok (Printf.sprintf "armed %d schedules\n" (List.length exprs))) with wrote = Store.changed s }
+         | "WS", "/__ws/touch" -> ok "ok\n"
+         | "WS", (("/__ws/message" | "/__ws/close") as p) -> (
+             let name = if p = "/__ws/message" then "ws_message" else "ws_close" in
+             match in_savepoint s (fun () -> Celld_js.call rt ~name ~cell ~meth:"" ~path:"" ~query:[] ~body) with
+             | Ok r -> { (ok "") with wrote = Store.changed s; effects = r.effects }
+             | Error e -> err 500 ("uncaught exception: " ^ e ^ "\n"))
          | "QUEUE", "/__queue/deliver" -> (
              match guarded s (fun () -> call ~name:"queue" body) with
-             | Ok r -> { status = 200; body = r.body; wrote = Store.changed s; content_type = "application/json" }
-             | Error r -> { status = 500; body = r.body; wrote = Store.changed s; content_type = "application/json" })
+             | Ok r -> { status = 200; body = r.body; wrote = Store.changed s; content_type = "application/json"; effects = "" }
+             | Error r -> { status = 500; body = r.body; wrote = Store.changed s; content_type = "application/json"; effects = "" })
          | _ -> (
              match in_savepoint s (fun () -> Celld_js.call rt ~name:"fetch" ~cell ~meth ~path ~query ~body) with
-             | Ok r -> { status = r.status; body = r.body; wrote = Store.changed s; content_type = r.content_type }
+             | Ok r -> { status = r.status; body = r.body; wrote = Store.changed s; content_type = r.content_type; effects = r.effects }
              | Error e -> err 500 ("uncaught exception: " ^ e ^ "\n"))))
