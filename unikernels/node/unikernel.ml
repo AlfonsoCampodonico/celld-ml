@@ -42,6 +42,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
   module H = Celld_http_mirage.Make (S)
   module B = Celld_bucketc.Make (S)
   module D = Celld_blocklog_mirage.Make (Blk)
+  module Tls_flow = Tls_mirage.Make (S.TCP)
 
   let now_ms () = int_of_float (Ptime.to_float_s (Mirage_ptime.now ()) *. 1000.)
   let sleep_ms ms = Mirage_sleep.ns (Int64.mul (Int64.of_int (max 0 ms)) 1_000_000L)
@@ -94,6 +95,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
     session : string;
     fleet : bool;
     mutable secret : string;
+    mutable peer_client : Tls.Config.client option;  (** pins the fleet certificate *)
     mailbox : (event -> unit);
     runtimes : (cell_id, runtime) Hashtbl.t;
     log : entry Queue.t;  (** entries not yet uploaded, in seq order *)
@@ -146,10 +148,39 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         else (Hashtbl.replace t.nonces nonce now; Ok source)
     | _ -> Error "unsigned"
 
+  let tls_conn tls =
+    {
+      H.write =
+        (fun s ->
+          Tls_flow.write tls (Cstruct.of_string s) >|= function
+          | Ok () -> Ok ()
+          | Error e -> Error (Fmt.str "%a" Tls_flow.pp_write_error e));
+      read =
+        (fun () ->
+          Tls_flow.read tls >|= function
+          | Ok (`Data cs) -> `Data (Cstruct.to_string cs)
+          | Ok `Eof -> `Eof
+          | Error e -> `Error (Fmt.str "%a" Tls_flow.pp_error e));
+      close = (fun () -> Tls_flow.close tls);
+    }
+
+  (* Peer requests go over TLS that pins the fleet certificate, and are
+     also HMAC-signed with the fleet secret. *)
   let peer_call t addr ?(headers = []) ~meth ~path body =
     let ip, port = parse_addr addr in
     let headers = sign t ~meth ~path ~body @ headers in
-    H.request t.stack ~timeout_ns:5_000_000_000L ip port { Celld_http.meth; target = path; headers; body }
+    let connect () =
+      match t.peer_client with
+      | None -> Lwt.return (Error "fleet TLS identity not loaded")
+      | Some config -> (
+          S.TCP.create_connection (S.tcp t.stack) (ip, port) >>= function
+          | Error e -> Lwt.return (Error (Fmt.str "%a" S.TCP.pp_error e))
+          | Ok flow -> (
+              Tls_flow.client_of_flow config flow >|= function
+              | Ok tls -> Ok (tls_conn tls)
+              | Error e -> Error (Fmt.str "tls: %a" Tls_flow.pp_write_error e)))
+    in
+    H.request_over ~connect ~default_host:addr ~timeout_ns:5_000_000_000L { Celld_http.meth; target = path; headers; body }
 
   (* ---- durability bookkeeping ---- *)
 
@@ -267,7 +298,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
             B.get t.bucket k >|= function
             | Ok (Some (body, etag)) -> (
                 match Wire.lease_of_json body ~etag with
-                | Ok l when l.l_node <> t.me && l.l_expires_ms > now_ms () && l.l_protocol = 5 && not l.l_draining -> Some l
+                | Ok l when l.l_node <> t.me && l.l_expires_ms > now_ms () && l.l_protocol = default_config.protocol && not l.l_draining -> Some l
                 | _ -> None)
             | _ -> None)
           keys
@@ -873,6 +904,51 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         | _ -> Lwt.return (text 404 "unknown peer endpoint\n"))
 
   (* The fleet secret: created once, conditionally, by whichever node is first. *)
+  (* The fleet TLS identity: a P-256 key and a self-signed certificate,
+     created once, conditionally, by whichever node is first, like the fleet
+     secret. Anyone who can read the bucket can already impersonate the
+     fleet through that secret, so this adds no new trust in the bucket; it
+     keeps peer traffic private and tamper-proof on the network. *)
+  let rec peer_tls bucket =
+    let load body =
+      match Wire.of_string body with
+      | Error e -> Error e
+      | Ok j -> (
+          match X509.Certificate.decode_pem (Wire.str_field "cert" j), X509.Private_key.decode_pem (Wire.str_field "key" j) with
+          | Ok cert, Ok key -> Ok (cert, key)
+          | Error (`Msg e), _ | _, Error (`Msg e) -> Error e)
+    in
+    B.get bucket Wire.peer_tls_key >>= function
+    | Ok (Some (body, _)) -> ( match load body with Ok id -> Lwt.return id | Error e -> failwith ("bad " ^ Wire.peer_tls_key ^ ": " ^ e))
+    | Ok None -> (
+        let key = X509.Private_key.generate `P256 in
+        let name = [ X509.Distinguished_name.(Relative_distinguished_name.singleton (CN (Common_name.v "celld-ml fleet"))) ] in
+        let now = Mirage_ptime.now () in
+        let until = Option.value (Ptime.add_span now (Ptime.Span.of_int_s (20 * 365 * 86400))) ~default:now in
+        let cert =
+          match X509.Signing_request.create name key with
+          | Error (`Msg e) -> failwith e
+          | Ok csr -> (
+              match X509.Signing_request.sign csr ~valid_from:now ~valid_until:until key name with
+              | Ok c -> c
+              | Error e -> failwith (Fmt.str "%a" X509.Validation.pp_signature_error e))
+        in
+        let body = Wire.to_string (Wire.Obj [ ("cert", Wire.Str (X509.Certificate.encode_pem cert)); ("key", Wire.Str (X509.Private_key.encode_pem key)) ]) in
+        B.put bucket ~guard:B.Absent Wire.peer_tls_key body >>= function
+        | Ok (`Ok _) -> Log.info (fun m -> m "created the fleet TLS identity"); Lwt.return (cert, key)
+        | _ -> peer_tls bucket)
+    | Error f ->
+        Log.warn (fun m -> m "cannot read the fleet TLS identity (%s); retrying" (string_of_failure (fail_of f)));
+        sleep_ms 2_000 >>= fun () -> peer_tls bucket
+
+  let serve_tls stack ~port config handler =
+    S.TCP.listen (S.tcp stack) ~port (fun flow ->
+        Tls_flow.server_of_flow config flow >>= function
+        | Ok tls -> H.handle_conn handler (tls_conn tls)
+        | Error e ->
+            Log.debug (fun m -> m "peer TLS handshake failed: %a" Tls_flow.pp_write_error e);
+            S.TCP.close flow)
+
   let rec peer_secret bucket =
     B.get bucket Wire.peer_auth_key >>= function
     | Ok (Some (body, _)) -> ( match Wire.of_string body with Ok j -> Lwt.return (Wire.str_field "secret" j) | Error _ -> failwith "bad peer-auth.json")
@@ -942,6 +1018,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         stack; bucket; core; me; session;
         fleet = durability () = "fleet";
         secret = "";
+        peer_client = None;
         mailbox = (fun ev -> push (Some ev));
         runtimes = Hashtbl.create 16;
         log = Queue.create ();
@@ -969,7 +1046,14 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
     Log.info (fun m -> m "celld-ml node %s session %s, bucket %s, durability %s" me session (bucket_addr ()) (durability ()));
     peer_secret bucket >>= fun secret ->
     t.secret <- secret;
-    H.serve stack ~port:internal_port (internal t);
+    peer_tls bucket >>= fun (cert, key) ->
+    let server =
+      match Tls.Config.server ~certificates:(`Single ([ cert ], key)) () with Ok c -> c | Error (`Msg e) -> failwith ("peer TLS server: " ^ e)
+    in
+    let fingerprint = X509.Certificate.fingerprint `SHA256 cert in
+    let authenticator = X509.Authenticator.cert_fingerprint ~time:(fun () -> Some (Mirage_ptime.now ())) ~hash:`SHA256 ~fingerprint in
+    t.peer_client <- (match Tls.Config.client ~authenticator () with Ok c -> Some c | Error (`Msg e) -> failwith ("peer TLS client: " ^ e));
+    serve_tls stack ~port:internal_port server (internal t);
     H.serve stack ~port:public_port (public t);
     Lwt.async (fun () -> actor t stream);
     t.mailbox Start_node;

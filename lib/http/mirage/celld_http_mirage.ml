@@ -20,12 +20,31 @@ module Make (S : Tcpip.Stack.V4V6) = struct
   let internal_error msg =
     { Celld_http.status = 500; headers = [ ("Content-Type", "text/plain") ]; body = msg ^ "\n" }
 
+  (* A connected byte stream: plain TCP here, TLS in the bucket client. *)
+  type conn = {
+    write : string -> (unit, string) result Lwt.t;
+    read : unit -> [ `Data of string | `Eof | `Error of string ] Lwt.t;
+    close : unit -> unit Lwt.t;
+  }
+
+  let tcp_conn flow =
+    {
+      write = write_string flow;
+      read =
+        (fun () ->
+          T.read flow >|= function
+          | Ok (`Data cs) -> `Data (Cstruct.to_string cs)
+          | Ok `Eof -> `Eof
+          | Error e -> `Error (Fmt.str "%a" T.pp_error e));
+      close = (fun () -> T.close flow);
+    }
+
   (* Per-connection loop. [buf] holds bytes received but not yet consumed. *)
-  let handle_flow handler flow =
+  let handle_conn handler conn =
     let buf = Buffer.create 4096 in
     (* Minimum buffer length before it is worth re-parsing. *)
     let need = ref 0 in
-    let close () = T.close flow in
+    let close () = conn.close () in
     let rec loop () =
       if Buffer.length buf = 0 || Buffer.length buf < !need then read_more ()
       else
@@ -48,7 +67,7 @@ module Make (S : Tcpip.Stack.V4V6) = struct
               { resp with Celld_http.headers = ("Connection", "close") :: resp.headers }
             else resp
           in
-          write_string flow (Celld_http.serialize_response resp) >>= ( function
+          conn.write (Celld_http.serialize_response resp) >>= ( function
           | Error e ->
               Log.debug (fun m -> m "write failed: %s" e);
               close ()
@@ -58,50 +77,32 @@ module Make (S : Tcpip.Stack.V4V6) = struct
           let resp =
             { Celld_http.status = 400; headers = [ ("Connection", "close") ]; body = e ^ "\n" }
           in
-          write_string flow (Celld_http.serialize_response resp) >>= fun _ -> close ()
+          conn.write (Celld_http.serialize_response resp) >>= fun _ -> close ()
       | Celld_http.Partial ->
           (match Celld_http.expected_length contents with
           | Some n -> need := n
           | None -> need := 0);
           read_more ()
     and read_more () =
-          T.read flow >>= function
-          | Ok (`Data cs) ->
-              Buffer.add_string buf (Cstruct.to_string cs);
+          conn.read () >>= function
+          | `Data d ->
+              Buffer.add_string buf d;
               loop ()
-          | Ok `Eof -> close ()
-          | Error e ->
-              Log.debug (fun m -> m "read failed: %a" T.pp_error e);
+          | `Eof -> close ()
+          | `Error e ->
+              Log.debug (fun m -> m "read failed: %s" e);
               close ()
     in
     Lwt.catch loop (fun exn ->
         Log.err (fun m -> m "connection loop raised: %s" (Printexc.to_string exn));
         close ())
 
-  let serve s ~port handler = T.listen (S.tcp s) ~port (handle_flow handler)
-
-  (* A connected byte stream: plain TCP here, TLS in the bucket client. *)
-  type conn = {
-    write : string -> (unit, string) result Lwt.t;
-    read : unit -> [ `Data of string | `Eof | `Error of string ] Lwt.t;
-    close : unit -> unit Lwt.t;
-  }
+  let serve s ~port handler = T.listen (S.tcp s) ~port (fun flow -> handle_conn handler (tcp_conn flow))
 
   let tcp_connect s ip port =
     T.create_connection (S.tcp s) (ip, port) >|= function
     | Error e -> Error (Fmt.str "%a" T.pp_error e)
-    | Ok flow ->
-        Ok
-          {
-            write = write_string flow;
-            read =
-              (fun () ->
-                T.read flow >|= function
-                | Ok (`Data cs) -> `Data (Cstruct.to_string cs)
-                | Ok `Eof -> `Eof
-                | Error e -> `Error (Fmt.str "%a" T.pp_error e));
-            close = (fun () -> T.close flow);
-          }
+    | Ok flow -> Ok (tcp_conn flow)
 
   (* One request on a fresh connection from [connect]. A failure before the
      request could have left is [`Connect]; after, [`Io] or [`Timeout]. *)

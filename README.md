@@ -200,8 +200,14 @@ claim its cells.
   The certificate is checked against the Mozilla root store, or pinned
   with `--s3-tls-fingerprint`. The unikernel has no DNS, so the endpoint is
   an IP and `--s3-host` sets the Host header and TLS name.
-- **Signed peer HTTP.** Requests are HMAC-SHA256-signed with a fleet secret
-  that is created once with a conditional write.
+- **Encrypted, signed peer traffic.** The peer port (8081) speaks TLS 1.3
+  with a fleet identity: the first node creates a P-256 key and a
+  self-signed certificate in `fleet/peer-tls.json` with a conditional write,
+  and every node serves with it and pins it when calling peers. Requests
+  are also HMAC-SHA256-signed with a fleet secret created the same way.
+  Whoever can read the bucket can impersonate the fleet either way, so the
+  bucket stays the root of trust. The protocol version is 6, so nodes
+  without peer TLS are not recruited.
 
 The fork leaves out queues, cron, WebSockets and the tunnel. A forwarded request is one signed POST.
 
@@ -303,6 +309,9 @@ dune build @runtest --root . --build-dir _build_all
   an alarm, a JS class and a takeover with no state lost. The same ran over
   HTTPS with a pinned certificate. A node given the wrong pin refused the
   store (`authentication failure: fingerprint`) and served nothing.
+- **Peer TLS:** a packet capture of a forwarded write showed 358 packets
+  of TLS records on port 8081 and none of the request's plaintext, and a
+  takeover recovered the dead owner's log over TLS.
 - **Alarms:** an alarm fired on its owner's timer, an alarm on a cell
   evicted 5 s earlier woke it at e2 and fired once, and an alarm whose
   owner was killed fired on the node that took over. The `alarms/` index

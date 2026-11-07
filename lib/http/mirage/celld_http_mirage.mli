@@ -1,19 +1,24 @@
 (** HTTP/1.1 server and client over a MirageOS TCP/IP stack. *)
 
 module Make (S : Tcpip.Stack.V4V6) : sig
+  (** A connected byte stream, so client and server run over TCP or TLS. *)
+  type conn = {
+    write : string -> (unit, string) result Lwt.t;
+    read : unit -> [ `Data of string | `Eof | `Error of string ] Lwt.t;
+    close : unit -> unit Lwt.t;
+  }
+
+  val tcp_conn : S.TCP.flow -> conn
+
+  val handle_conn : (Celld_http.request -> Celld_http.response Lwt.t) -> conn -> unit Lwt.t
+  (** The server loop of {!serve} on one connection. *)
+
   val serve :
     S.t -> port:int -> (Celld_http.request -> Celld_http.response Lwt.t) -> unit
   (** Listens on [port]. Each connection runs a keep-alive loop that handles
       pipelined requests in order; [Connection: close] from the client ends
       it after the reply. Handler exceptions become 500; unparseable input
       gets 400 and the connection is closed. *)
-
-  (** A connected byte stream, so the client runs over TCP or TLS. *)
-  type conn = {
-    write : string -> (unit, string) result Lwt.t;
-    read : unit -> [ `Data of string | `Eof | `Error of string ] Lwt.t;
-    close : unit -> unit Lwt.t;
-  }
 
   val tcp_connect : S.t -> Ipaddr.t -> int -> (conn, string) result Lwt.t
 

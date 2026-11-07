@@ -224,6 +224,7 @@ let own_key cell = "cells/" ^ cell ^ "/own.json"
 let lease_key node = "nodes/" ^ node ^ ".json"
 let ltx_prefix cell = "cells/" ^ cell ^ "/ltx/"
 let peer_auth_key = "fleet/peer-auth.json"
+let peer_tls_key = "fleet/peer-tls.json"
 
 (* ---- peer request signing (HMAC is supplied by the caller) ---- *)
 

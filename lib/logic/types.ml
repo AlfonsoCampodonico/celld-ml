@@ -129,7 +129,7 @@ type config = {
 }
 
 let default_config =
-  { ttl_ms = 10_000; idle_ms = 30_000; sweep_ms = 1_000; protocol = 5; max_reconciles = 3 }
+  { ttl_ms = 10_000; idle_ms = 30_000; sweep_ms = 1_000; protocol = 6; max_reconciles = 3 }
 
 let string_of_failure = function Definite s -> "definite: " ^ s | Ambiguous s -> "ambiguous: " ^ s
 
