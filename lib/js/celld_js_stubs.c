@@ -62,6 +62,7 @@ struct winst {
   JSValue buf;
   uint8_t *buf_ptr;
   uint32_t buf_len;
+  int started; /* its start function finished: only then may JS reach it */
 };
 
 /* Allocator with a size header, so the memory limit counts real bytes on
@@ -600,6 +601,8 @@ static JSValue js_wasm_instantiate(JSContext *ctx, JSValueConst this_val, int ar
   wasm_depth++;
   res = m3_RunStart(m);
   wasm_depth--;
+  /* back in JS: the start function may have moved any instance's memory */
+  wasm_check_all(c);
   if (res) {
     if (!JS_IsUndefined(c->wasm_exc)) { JSValue e = c->wasm_exc; c->wasm_exc = JS_UNDEFINED; return JS_Throw(ctx, e); }
     return JS_ThrowTypeError(ctx, "start function trapped: %s", res);
@@ -619,6 +622,7 @@ static JSValue js_wasm_instantiate(JSContext *ctx, JSValueConst this_val, int ar
   }
   uint32_t mlen = 0;
   uint8_t *mem = m3_GetMemory(w->rt, &mlen, 0);
+  w->started = 1;
   JS_SetPropertyStr(ctx, out, "id", JS_NewInt32(ctx, id));
   JS_SetPropertyStr(ctx, out, "exports", exports);
   JS_SetPropertyStr(ctx, out, "memory", JS_NewBool(ctx, mem != NULL));
@@ -627,7 +631,7 @@ static JSValue js_wasm_instantiate(JSContext *ctx, JSValueConst this_val, int ar
 
 static struct winst *wasm_inst(JSContext *ctx, struct cell *c, JSValueConst idv) {
   int32_t id;
-  if (!c || JS_ToInt32(ctx, &id, idv) || id < 0 || id >= c->nwasm || !c->wasm[id]->rt) return NULL;
+  if (!c || JS_ToInt32(ctx, &id, idv) || id < 0 || id >= c->nwasm || !c->wasm[id]->rt || !c->wasm[id]->started) return NULL;
   return c->wasm[id];
 }
 

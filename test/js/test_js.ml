@@ -340,3 +340,27 @@ let () =
           check "an infinite loop is stopped by the budget" (has {|"spin":"RuntimeError: [trap] WebAssembly instruction budget exhausted"|});
           check "the instance works after a trap" (has {|"after":2|});
           check "a missing import is a LinkError" (has {|"link":"LinkError"|}))
+
+(* During a module's start function, its instance is out of reach: a JS
+   import that guesses the new id gets nothing. *)
+let () =
+  let db = Celld_sqlite.open_image "" in
+  (* (import "env" "peek" (func)) (memory 1) (start 0) *)
+  let wasm = "0061736d0100000001040160000002" ^ "0c0103656e76047065656b0000" ^ "05030100010801" ^ "00" in
+  let hex = String.concat "" (List.init (String.length wasm / 2) (fun i -> Printf.sprintf "0x%s," (String.sub wasm (2 * i) 2))) in
+  let script =
+    Printf.sprintf
+      {|function fetch() {
+          let reached = "nothing";
+          const peek = () => { for (let id = 0; id < 4; id++) { try { __celld_wasm_memory(id); reached = "instance " + id; } catch (e) {} } };
+          new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array([%s])), { env: { peek } });
+          return reached;
+        }|}
+      hex
+  in
+  match Celld_js.create ~db ~script with
+  | Error e -> check e false
+  | Ok t -> (
+      match Celld_js.call_sync t ~name:"fetch" ~cell:"S:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" with
+      | Ok r -> check "an instance is unreachable until its start function finishes" (r.body = "nothing")
+      | Error e -> check ("start: " ^ e) false)
