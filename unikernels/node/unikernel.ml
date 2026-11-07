@@ -25,8 +25,6 @@ let advertise = arg "advertise" "ip:port where peers reach this node's internal 
 let bucket_addr = arg "bucket" "ip:port of the celld-ml bucket, or s3://ip:port/bucket for an S3-compatible store." Cmdliner.Arg.string "10.0.0.2:9000"
 let s3_host = arg "s3-host" "Host header and TLS server name for S3 (default: the address)." Cmdliner.Arg.string ""
 let s3_region = arg "s3-region" "S3 signing region." Cmdliner.Arg.string "us-east-1"
-let s3_access_key = arg "s3-access-key" "S3 access key id." Cmdliner.Arg.string ""
-let s3_secret_key = arg "s3-secret-key" "S3 secret access key." Cmdliner.Arg.string ""
 let s3_tls = arg "s3-tls" "Talk to S3 over TLS." Cmdliner.Arg.bool false
 let s3_tls_fingerprint = arg "s3-tls-fingerprint" "Pin the S3 server certificate by SHA-256 fingerprint (hex) instead of trusting the Mozilla root store." Cmdliner.Arg.string ""
 let ttl_ms = arg "ttl-ms" "Node lease lifetime." Cmdliner.Arg.int 10_000
@@ -40,7 +38,7 @@ let upload_delay_ms = arg "upload-delay-ms" "Delay before each LTX upload (to sh
 let public_port = 8080
 let internal_port = 8081
 
-module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
+module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S) = struct
   module H = Celld_http_mirage.Make (S)
   module B = Celld_bucketc.Make (S)
   module D = Celld_blocklog_mirage.Make (Blk)
@@ -887,8 +885,29 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         Log.warn (fun m -> m "cannot read the fleet secret from the bucket (%s); retrying" (string_of_failure (fail_of f)));
         sleep_ms 2_000 >>= fun () -> peer_secret bucket
 
-  let start stack blk =
+  (* The secrets device: key=value lines, NUL-padded, at most 64 KiB. *)
+  let read_secrets sec =
+    Sec.get_info sec >>= fun info ->
+    let sectors = min (Int64.to_int info.size_sectors) (65536 / info.sector_size) in
+    if sectors <= 0 then Lwt.return []
+    else
+      let buf = Cstruct.create (sectors * info.sector_size) in
+      Sec.read sec 0L [ buf ] >|= function
+      | Error _ -> []
+      | Ok () ->
+          let s = Cstruct.to_string buf in
+          let s = match String.index_opt s '\000' with Some i -> String.sub s 0 i | None -> s in
+          List.filter_map
+            (fun line ->
+              match String.index_opt line '=' with
+              | Some i -> Some (String.trim (String.sub line 0 i), String.trim (String.sub line (i + 1) (String.length line - i - 1)))
+              | None -> None)
+            (String.split_on_char '\n' s)
+
+  let start stack blk sec =
     let me = node_id () in
+    read_secrets sec >>= fun secrets ->
+    let secret k = Option.value (List.assoc_opt k secrets) ~default:"" in
     D.open_ blk >>= fun (disk, records) ->
     let bucket =
       let b = bucket_addr () in
@@ -904,7 +923,9 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
             | Ok c -> Some c
             | Error e -> failwith ("TLS configuration: " ^ e)
         in
-        let creds = { Celld_s3.access_key = s3_access_key (); secret_key = s3_secret_key (); region = s3_region () } in
+        if secret "s3_access_key" = "" || secret "s3_secret_key" = "" then
+          Log.warn (fun m -> m "no S3 credentials on the secrets device (s3_access_key=..., s3_secret_key=...)");
+        let creds = { Celld_s3.access_key = secret "s3_access_key"; secret_key = secret "s3_secret_key"; region = s3_region () } in
         B.create ~host ?tls ~s3:{ B.bucket = name; creds } stack ip port
       end
       else

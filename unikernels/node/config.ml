@@ -24,7 +24,11 @@ let packages =
     package "ipaddr";
   ]
 
-let main = main ~packages "Unikernel.Make" (stackv4v6 @-> block @-> job)
+let main = main ~packages "Unikernel.Make" (stackv4v6 @-> block @-> block @-> job)
 let stack = generic_stackv4v6 default_network
 let log = block_of_file "log"
-let () = register "node" [ main $ stack $ log ]
+
+(* Credentials as key=value lines on their own small device, so they never
+   appear in the host's process list. *)
+let secrets = block_of_file "secrets"
+let () = register "node" [ main $ stack $ log $ secrets ]

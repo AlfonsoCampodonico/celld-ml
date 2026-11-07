@@ -190,8 +190,11 @@ claim its cells.
   owner died. A fire that finds nothing due is a no-op.
 - **Any S3-compatible bucket, over TLS.** `--bucket=s3://IP:PORT/BUCKET`
   makes the nodes use a real object store instead of the bucket unikernel.
-  Requests are path-style and SigV4-signed (`--s3-access-key`,
-  `--s3-secret-key`, `--s3-region`), listing uses ListObjectsV2, and
+  Requests are path-style and SigV4-signed (`--s3-region`). The keys are
+  never arguments: they are `s3_access_key=` and `s3_secret_key=` lines on
+  a small `secrets` block device, which `fleet.sh` writes from
+  `S3_ACCESS_KEY` and `S3_SECRET_KEY` as a file only you can read. Listing
+  uses ListObjectsV2, and
   ownership still rests on `If-None-Match: *` and `If-Match` on PUT, which
   S3 and its clones now support. `--s3-tls=true` uses TLS (ocaml-tls).
   The certificate is checked against the Mozilla root store, or pinned
@@ -244,7 +247,7 @@ scripts/fleet.sh down
 Against an S3-compatible store instead of the bucket unikernel:
 
 ```bash
-NODE_BUCKET=s3://10.0.0.1:9100/celld NODE_ARGS="--s3-access-key=KEY --s3-secret-key=SECRET" scripts/fleet.sh up 3
+S3_ACCESS_KEY=KEY S3_SECRET_KEY=SECRET NODE_BUCKET=s3://10.0.0.1:9100/celld scripts/fleet.sh up 3
 ```
 
 `build.sh` patches two vendored dependencies:

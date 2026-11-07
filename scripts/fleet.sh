@@ -35,12 +35,24 @@ start_bucket() {
   wait_for bucket "listening on port"
 }
 
+# S3 credentials come from S3_ACCESS_KEY / S3_SECRET_KEY and reach the nodes
+# on a device image readable only by this user, never on a command line.
+write_secrets() {
+  ( umask 077
+    { [ -n "${S3_ACCESS_KEY:-}" ] && echo "s3_access_key=$S3_ACCESS_KEY"
+      [ -n "${S3_SECRET_KEY:-}" ] && echo "s3_secret_key=$S3_SECRET_KEY"
+      true; } > "$run/secrets.txt"
+    truncate -s 64K "$run/secrets.txt"
+    mv "$run/secrets.txt" "$run/secrets.img" )
+}
+
 start_node() { # i args...
   local i=$1; shift
+  write_secrets
   stop_one "n$i"
   # The follower log survives restarts; `up` starts every node with a blank one.
   [ -f "$run/n$i.img" ] || truncate -s "${LOG_SIZE:-64M}" "$run/n$i.img"
-  boot "n$i" "tap$i" node "--block:log=$run/n$i.img" "$root/unikernels/node/dist/node.hvt" \
+  boot "n$i" "tap$i" node "--block:log=$run/n$i.img" "--block:secrets=$run/secrets.img" "$root/unikernels/node/dist/node.hvt" \
     "--ipv4=10.0.0.1$i/24" --ipv4-gateway=10.0.0.1 "--node-id=n$i" "--advertise=10.0.0.1$i:8081" \
     "--bucket=${NODE_BUCKET:-10.0.0.2:9000}" ${NODE_ARGS:-} "$@"
   wait_for "n$i" "celld-ml node"
