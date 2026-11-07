@@ -11,3 +11,9 @@ unikernels/*/dune-project
 unikernels/*/dune-workspace
 unikernels/*/lib
 *.img
+
+# Fetched by scripts/fetch-vendor.sh
+lib/sqlite/sqlite3.c
+lib/sqlite/sqlite3.h
+lib/js/quickjs/
+*.hvt.debug

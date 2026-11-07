@@ -10,11 +10,12 @@ format and crates/ltx and was rewritten in OCaml; the protocols in
 lib/logic, lib/wire and unikernels/node follow celld's design. These are
 modified works: none of celld's source is included verbatim.
 
-lib/sqlite/sqlite3.c and sqlite3.h are the SQLite 3.54.1 amalgamation
-(https://sqlite.org), which is in the public domain.
+scripts/fetch-vendor.sh downloads the SQLite 3.54.1 amalgamation
+(https://sqlite.org), which is in the public domain, into lib/sqlite.
 
-lib/js/quickjs is the QuickJS engine, release 2026-06-04
+It also downloads the QuickJS engine, release 2026-06-04
 (https://bellard.org/quickjs), Copyright (c) 2017-2021 Fabrice Bellard and
-Charlie Gordon, under the MIT License; see lib/js/quickjs/LICENSE. One
-line of quickjs.c is modified, marked "celld-ml": Atomics can be turned
-off with CELLD_NO_ATOMICS.
+Charlie Gordon, under the MIT License, into lib/js/quickjs (its LICENSE
+comes with it), and modifies one line of quickjs.c, marked "celld-ml", so
+Atomics can be turned off with CELLD_NO_ATOMICS. Built unikernels contain
+both, so distributing them carries these notices.

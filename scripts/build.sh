@@ -6,6 +6,7 @@ name=${1:?usage: build.sh node|bucket}
 root=$(cd "$(dirname "$0")/.." && pwd)
 dir="$root/unikernels/$name"
 eval "$(opam env --switch=mirage)"
+"$root/scripts/fetch-vendor.sh"
 cd "$dir"
 ln -sfn ../../lib lib
 
@@ -29,4 +30,10 @@ if [ -f LIBS ]; then
 fi
 
 dune build --profile release --root . ./dist
-ls -l dist/*.hvt
+# Ship the image without debug information (about a third of the size);
+# keep the full one next to it for debugging.
+chmod u+w "dist/$name.hvt"
+cp "dist/$name.hvt" "dist/$name.hvt.debug"
+"$(opam var bin)/aarch64-solo5-ocaml-strip" "dist/$name.hvt" 2>/dev/null \
+  || "$(opam var bin)/x86_64-solo5-ocaml-strip" "dist/$name.hvt"
+ls -l dist/*.hvt*

@@ -219,8 +219,8 @@ The fork leaves out queues, cron, WebSockets and the tunnel. A forwarded request
 | `lib/ltx` | the LTX format, CRC-64, and an LZ4 block codec written from the format spec |
 | `lib/cell` | the page store (KV or SQLite), capture, restore planning, GC, and the cell classes |
 | `lib/s3` | SigV4 signing (checked against AWS's published examples), key encoding, ListObjectsV2 parsing |
-| `lib/js` | the vendored QuickJS engine (2026-06-04), the Solo5 shims it needs, and the JS cell runtime: prelude, storage binding, budgets |
-| `lib/sqlite` | the vendored SQLite amalgamation, an in-memory VFS with dirty-page tracking, and the OCaml binding |
+| `lib/js` | the JS cell runtime over QuickJS 2026-06-04 (fetched by `scripts/fetch-vendor.sh`): the Solo5 shims it needs, prelude, storage binding, budgets |
+| `lib/sqlite` | SQLite 3.54.1 (fetched by `scripts/fetch-vendor.sh`), an in-memory VFS with dirty-page tracking, limits, and the OCaml binding |
 | `lib/wire` | JSON records, the `CLA1` log batch, and peer signing helpers |
 | `lib/http`, `lib/http/mirage`, `lib/bucketc` | HTTP/1.1, plus server and client over mirage-tcpip, plus the bucket client |
 | `unikernels/bucket` | an S3-like object store with ETag CAS, persisted to a block device |
@@ -241,7 +241,7 @@ Inside the VM, install opam, an OCaml 5.3 switch named `mirage`, and the
 `mirage`, `dune`, `solo5` and `ocaml-solo5` packages. Then:
 
 ```bash
-scripts/build.sh bucket && scripts/build.sh node
+scripts/build.sh bucket && scripts/build.sh node   # fetches SQLite and QuickJS, ships stripped images
 scripts/fleet.sh up 3                  # bucket at 10.0.0.2, nodes n1..n3 at 10.0.0.11..13
 curl -X POST http://10.0.0.11:8080/do/Counter:demo/increment
 curl http://10.0.0.12:8080/do/Counter:demo          # forwarded to the owner
@@ -269,6 +269,7 @@ Lwt is also pinned below 6, which crashes under mirage-solo5.
 Native tests:
 
 ```bash
+scripts/fetch-vendor.sh
 dune build @runtest --root . --build-dir _build_all
 ```
 
