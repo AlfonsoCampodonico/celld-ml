@@ -155,3 +155,23 @@ let () =
       | Error e -> check e false)
   | Ok (Celld_js.Reply _) -> check "fetch suspends" false
   | Error e -> check e false
+
+(* A data argument whose toString detaches the key's buffer: the key was
+   copied first, so the HMAC still uses its original bytes. *)
+let () =
+  let db = Celld_sqlite.open_image "" in
+  match
+    Celld_js.create ~db
+      ~script:
+        {|function fetch() {
+            const keyBuf = new TextEncoder().encode("key").buffer;
+            const sneaky = { toString() { try { structuredClone(keyBuf); keyBuf.transfer?.(); } catch (e) {} return "The quick brown fox jumps over the lazy dog"; } };
+            const mac = new Uint8Array(__celld_hmac("sha256", new Uint8Array(keyBuf), sneaky));
+            return Array.from(mac, (b) => b.toString(16).padStart(2, "0")).join("");
+          }|}
+  with
+  | Error e -> check e false
+  | Ok t -> (
+      match Celld_js.call_sync t ~name:"fetch" ~cell:"X:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" with
+      | Ok r -> check "HMAC args are copied before user code runs" (r.body = "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
+      | Error e -> check e false)

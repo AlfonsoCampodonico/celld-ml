@@ -236,25 +236,38 @@ static JSValue js_sql_exec(JSContext *ctx, JSValueConst this_val, int argc, JSVa
 
 /* ---- natives backed by OCaml (registered with Callback.register) ---- */
 
-/* The bytes of an ArrayBuffer, a typed array or DataView, or a string
-   (UTF-8). [*free_str] is set when the result must go to JS_FreeCString. */
-static const uint8_t *bytes_of(JSContext *ctx, JSValueConst v, size_t *len, const char **free_str) {
-  *free_str = NULL;
+/* A private copy of the bytes of an ArrayBuffer, a typed array or
+   DataView, or a string (UTF-8). Converting a value can run user JS (a
+   toString), which could detach or resize another argument's buffer, so
+   every argument is copied before the next one is looked at. Returns NULL
+   on an exception or out of memory; free with free(). */
+static uint8_t *bytes_copy(JSContext *ctx, JSValueConst v, size_t *len) {
   size_t n;
   uint8_t *p = JS_GetArrayBuffer(ctx, &n, v);
-  if (p) { *len = n; return p; }
-  JS_FreeValue(ctx, JS_GetException(ctx));
-  size_t off, blen, bpe;
-  JSValue ab = JS_GetTypedArrayBuffer(ctx, v, &off, &blen, &bpe);
-  if (!JS_IsException(ab)) {
-    p = JS_GetArrayBuffer(ctx, &n, ab);
-    JS_FreeValue(ctx, ab);
-    if (p) { *len = blen; return p + off; }
+  if (!p) {
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    size_t off, blen, bpe;
+    JSValue ab = JS_GetTypedArrayBuffer(ctx, v, &off, &blen, &bpe);
+    if (!JS_IsException(ab)) {
+      uint8_t *base = JS_GetArrayBuffer(ctx, &n, ab);
+      JS_FreeValue(ctx, ab);
+      if (base && off + blen <= n) { p = base + off; n = blen; }
+    } else
+      JS_FreeValue(ctx, JS_GetException(ctx));
   }
-  JS_FreeValue(ctx, JS_GetException(ctx));
-  const char *s = JS_ToCStringLen(ctx, len, v);
-  *free_str = s;
-  return (const uint8_t *)s;
+  if (p) {
+    uint8_t *c = malloc(n ? n : 1);
+    if (c) memcpy(c, p, n);
+    *len = n;
+    return c;
+  }
+  const char *str = JS_ToCStringLen(ctx, &n, v);
+  if (!str) return NULL;
+  uint8_t *c = malloc(n ? n : 1);
+  if (c) memcpy(c, str, n);
+  JS_FreeCString(ctx, str);
+  *len = n;
+  return c;
 }
 
 static value ocaml_bytes(const uint8_t *p, size_t n) { return caml_alloc_initialized_string(n, (const char *)p); }
@@ -300,27 +313,34 @@ static JSValue js_hash(JSContext *ctx, int argc, JSValueConst *argv, int hmac) {
   if (argc < (hmac ? 3 : 2)) return JS_ThrowTypeError(ctx, "missing arguments");
   const value *f = caml_named_value(hmac ? "celld_js_hmac" : "celld_js_digest");
   if (!f) return JS_ThrowTypeError(ctx, "no digest support");
-  const char *alg = JS_ToCString(ctx, argv[0]);
-  if (!alg) return JS_EXCEPTION;
-  size_t kl = 0, dl;
-  const char *kf = NULL, *df;
-  const uint8_t *k = hmac ? bytes_of(ctx, argv[1], &kl, &kf) : NULL;
-  const uint8_t *d = bytes_of(ctx, argv[hmac ? 2 : 1], &dl, &df);
+  /* Each argument is copied out before the next conversion can run JS. */
+  const char *alg_js = JS_ToCString(ctx, argv[0]);
+  if (!alg_js) return JS_EXCEPTION;
+  char alg[16];
+  size_t al = strlen(alg_js);
+  if (al >= sizeof alg) al = sizeof alg - 1;
+  memcpy(alg, alg_js, al);
+  alg[al] = 0;
+  JS_FreeCString(ctx, alg_js);
+  size_t kl = 0, dl = 0;
+  uint8_t *k = NULL;
+  if (hmac && !(k = bytes_copy(ctx, argv[1], &kl))) return JS_EXCEPTION;
+  uint8_t *d = bytes_copy(ctx, argv[hmac ? 2 : 1], &dl);
+  if (!d) { free(k); return JS_EXCEPTION; }
   JSValue out;
   {
     CAMLparam0();
     CAMLlocal4(a, kb, db, r);
     a = caml_copy_string(alg);
-    db = ocaml_bytes(d ? d : (const uint8_t *)"", d ? dl : 0);
-    if (hmac) { kb = ocaml_bytes(k ? k : (const uint8_t *)"", k ? kl : 0); r = caml_callback3(*f, a, kb, db); }
+    db = ocaml_bytes(d, dl);
+    if (hmac) { kb = ocaml_bytes(k, kl); r = caml_callback3(*f, a, kb, db); }
     else r = caml_callback2(*f, a, db);
     if (caml_string_length(r) == 0) out = JS_ThrowTypeError(ctx, "unsupported algorithm %s", alg);
     else out = JS_NewArrayBufferCopy(ctx, (const uint8_t *)String_val(r), caml_string_length(r));
     CAMLdrop;
   }
-  JS_FreeCString(ctx, alg);
-  if (kf) JS_FreeCString(ctx, kf);
-  if (df) JS_FreeCString(ctx, df);
+  free(k);
+  free(d);
   return out;
 }
 static JSValue js_digest(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)t; return js_hash(ctx, argc, argv, 0); }
