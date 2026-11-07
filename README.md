@@ -159,10 +159,17 @@ claim its cells.
   `POST /.well-known/celld/drain` stops a node from taking ownership and
   hands off every cell. Once its log is in the bucket, the node writes an
   expired lease with no open log and exits 0, so no one has to recover it.
+- **Alarms.** `PUT /do/<cell>/__alarm?in_ms=N` (or `?at_ms=T`) sets the
+  cell's one alarm, and `GET` or `DELETE` read or clear it. The alarm is a
+  key in the cell's own state, so it is captured, replicated and moves with
+  the cell. The owner fires it as an ordinary write that runs the class's
+  alarm handler (Counter ticks, Kv counts firings). The bucket index
+  `alarms/<cell>` lets any node wake a cell that was evicted or whose
+  owner died. A fire that finds nothing due is a no-op.
 - **Signed peer HTTP.** Requests are HMAC-SHA256-signed with a fleet secret
   that is created once with a conditional write.
 
-The fork leaves out alarms, queues, cron, WebSockets and the tunnel. A forwarded request is one signed POST.
+The fork leaves out queues, cron, WebSockets and the tunnel. A forwarded request is one signed POST.
 
 ## Layout
 
@@ -239,6 +246,10 @@ dune build @runtest --root . --build-dir _build_all
   them 3/3/3 within one discovery round. Draining n2 then moved its 3 cells
   to n1 and n3, and n2 exited with code 0. All 9 counters kept their
   values.
+- **Alarms:** an alarm fired on its owner's timer, an alarm on a cell
+  evicted 5 s earlier woke it at e2 and fired once, and an alarm whose
+  owner was killed fired on the node that took over. The `alarms/` index
+  was empty afterwards.
 - **Partition:** a node cut off from the bucket logged
   `SELF-FENCE: node lease expired` and exited with code 3, and another node
   took over its cell at the next epoch with its state intact.

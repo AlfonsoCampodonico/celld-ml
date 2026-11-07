@@ -92,6 +92,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
     mutable want : peer list;
     mutable peers : lease list;  (** live, non-draining leases of other nodes, from the last discovery *)
     mutable last_shed_ms : int;
+    alarm_timers : (cell_id, int) Hashtbl.t;  (** the alarm each resident cell's timer waits for *)
     held : (string, held) Hashtbl.t;
     disk : D.t;  (** follower log: what [held] is rebuilt from after a restart *)
     disk_lock : Lwt_mutex.t;
@@ -405,6 +406,11 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
             | Ok `Precondition_failed -> Error (Definite "lost the recovery claim")
             | Error f -> Error (fail_of f)
 
+  (* Set once the alarm functions below exist: restore schedules a restored
+     cell's alarm through it. *)
+  let alarm_hook : (t -> cell_id -> int -> unit) ref = ref (fun _ _ _ -> ())
+  let push_alarm t cell at = !alarm_hook t cell at
+
   (* ---- compaction and epoch GC ----
      Derived data, so none of it goes through the node log or the output
      gate: a lost snapshot or a failed delete only leaves more files. *)
@@ -450,6 +456,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
                 (* Each epoch opens with a snapshot of what it restored. *)
                 if store.txid > 0L then capture t cell epoch store.txid (Store.snapshot store);
                 Log.info (fun m -> m "restored %s at e%d (txid %Ld, %d files)" cell epoch store.txid (List.length ok));
+                Option.iter (fun at -> push_alarm t cell at) (Handlers.alarm_of store);
                 Lwt.return (Ok ()))
         (* A previous owner's GC can delete a file between our list and get. *)
         | _, Error _ :: _ when not retried -> restore ~retried:true t cell epoch
@@ -573,6 +580,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
     | Stop_runtime { op; cell; epoch; reset } ->
         Log.info (fun m -> m "stopping %s at e%d%s" cell epoch (if reset then " (reset)" else ""));
         Hashtbl.remove t.runtimes cell;
+        Hashtbl.remove t.alarm_timers cell;
         (* Ensure_durable ran first, so this epoch's files are all in the
            bucket and older epochs are dead weight. *)
         if not reset then Lwt.async (fun () -> gc t cell ~epoch ~upto:0);
@@ -603,15 +611,72 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
     push t (Request { req; cell });
     p >|= fun r -> (req, r)
 
-  let run_local t req cell epoch ~meth ~path ~query ~body =
+  (* ---- alarms ----
+     The owner keeps a timer per resident cell with an alarm. The bucket
+     index alarms/<cell> lets any node wake a cell that was evicted before
+     its alarm came due. *)
+
+  let alarm_index cell = "alarms/" ^ cell
+
+  let rec fire t cell =
+    serve_cell t ~forwarded:true cell ~meth:"ALARM" ~path:"/__alarm/fire" ~query:[] ~body:"" >|= fun (r : Celld_http.response) ->
+    if r.status = 200 && r.body = "fired\n" then Log.info (fun m -> m "alarm fired for %s" cell);
+    r
+
+  and schedule_alarm t cell at =
+    Hashtbl.replace t.alarm_timers cell at;
+    Lwt.async (fun () ->
+        sleep_ms (at - now_ms ()) >>= fun () ->
+        (* Superseded, cleared or evicted: the index covers an evicted cell. *)
+        if Hashtbl.find_opt t.alarm_timers cell = Some at then (Hashtbl.remove t.alarm_timers cell; fire t cell >|= ignore)
+        else Lwt.return_unit)
+
+  (* A commit changed the cell's alarm. *)
+  and alarm_changed t cell alarm =
+    (match alarm with Some at -> schedule_alarm t cell at | None -> Hashtbl.remove t.alarm_timers cell);
+    Lwt.async (fun () ->
+        let rec go n =
+          (match alarm with
+          | Some at -> B.put t.bucket (alarm_index cell) (string_of_int at) >|= Result.is_ok
+          | None -> B.delete t.bucket (alarm_index cell) >|= Result.is_ok)
+          >>= fun ok -> if ok || n = 0 then Lwt.return_unit else sleep_ms 500 >>= fun () -> go (n - 1)
+        in
+        go 5)
+
+  (* Wake due alarms of cells no live node holds. A fire that finds nothing
+     due removes the index entry it read, unless it changed meanwhile. *)
+  and scan_alarms t =
+    B.list t.bucket ~prefix:"alarms/" >>= function
+    | Error _ -> Lwt.return_unit
+    | Ok keys ->
+        Lwt_list.iter_s
+          (fun k ->
+            let cell = String.sub k 7 (String.length k - 7) in
+            if Hashtbl.mem t.runtimes cell || not (Handlers.valid_cell cell) then Lwt.return_unit
+            else
+              B.get t.bucket k >>= function
+              | Ok (Some (body, etag)) -> (
+                  match int_of_string_opt body with
+                  | Some at when at <= now_ms () ->
+                      fire t cell >>= fun (r : Celld_http.response) ->
+                      if r.status = 200 && r.body = "not due\n" then B.delete t.bucket ~guard:(B.Match etag) k >|= ignore
+                      else Lwt.return_unit
+                  | _ -> Lwt.return_unit)
+              | _ -> Lwt.return_unit)
+          keys
+
+  and run_local t req cell epoch ~meth ~path ~query ~body =
     match Hashtbl.find_opt t.runtimes cell, Handlers.dispatch cell with
     | Some rt, Some handler when rt.epoch = epoch ->
         (* Handler and commit run without yielding: the cell is serial. *)
-        let reply = handler rt.store ~meth ~path ~query ~body in
+        let alarm_before = Handlers.alarm_of rt.store in
+        let reply = handler rt.store ~now_ms:(now_ms ()) ~meth ~path ~query ~body in
         let position =
           if reply.wrote then begin
             let txid, ltx = Store.commit rt.store in
             capture t cell epoch txid ltx;
+            let alarm = Handlers.alarm_of rt.store in
+            if alarm <> alarm_before then alarm_changed t cell alarm;
             let txid = Int64.to_int txid in
             if compact_every () > 0 && txid - rt.snap_txid >= compact_every () then begin
               rt.snap_txid <- txid;
@@ -635,7 +700,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         push t (Output_at { req; position = None });
         p >|= fun _ -> text 503 "cell runtime is not resident\n"
 
-  let rec serve_cell t ?(forwarded = false) ?(retried = false) cell ~meth ~path ~query ~body =
+  and serve_cell t ?(forwarded = false) ?(retried = false) cell ~meth ~path ~query ~body =
     resolve t cell >>= fun (req, route) ->
     match route with
     | Error e -> Lwt.return (text 503 (string_of_request_error e ^ "\n"))
@@ -656,6 +721,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         | Error (`Io _ | `Timeout) ->
             (* Ambiguous: the owner may have run it. Never re-send. *)
             Lwt.return (text 504 "owner did not answer; the request may have run\n"))
+
+  let () = alarm_hook := schedule_alarm
 
   let cell_of_target target =
     let path, query = Celld_http.path_and_query target in
@@ -781,6 +848,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         want = [];
         peers = [];
         last_shed_ms = 0;
+        alarm_timers = Hashtbl.create 16;
         held = Hashtbl.create 4;
         disk;
         disk_lock = Lwt_mutex.create ();
@@ -808,6 +876,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
           discover t >>= fun () ->
           if t.fleet then recruit t;
           rebalance_once t;
+          scan_alarms t >>= fun () ->
           sleep_ms 2_000 >>= loop
         in
         sleep_ms 500 >>= loop);

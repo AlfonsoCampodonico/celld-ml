@@ -91,3 +91,28 @@ let () =
   check "upto 0 only drops older epochs"
     (Store.garbage [ "e0000000000000001/0000/0000000000000001-0000000000000001.ltx"; "e0000000000000002/0000/0000000000000002-0000000000000002.ltx" ] ~epoch:2 ~upto:0
      = [ "e0000000000000001/0000/0000000000000001-0000000000000001.ltx" ])
+
+(* Alarms: set, not yet due, due, and survives a restore. *)
+let () =
+  let h = Option.get (Handlers.dispatch "Counter:a") in
+  let s = Store.empty () in
+  let call ?(query = []) ~now meth path = h s ~now_ms:now ~meth ~path ~query ~body:"" in
+  let r = call ~query:[ ("in_ms", "500") ] ~now:1000 "PUT" "/__alarm" in
+  check "setting an alarm is a write" (r.wrote && Handlers.alarm_of s = Some 1500);
+  let _, ltx = Store.commit s in
+  let r = call ~now:1200 "ALARM" "/__alarm/fire" in
+  check "early fire is a no-op" ((not r.wrote) && Handlers.alarm_of s = Some 1500);
+  let r = call ~now:1500 "ALARM" "/__alarm/fire" in
+  check "due fire clears it and runs the class handler"
+    (r.wrote && Handlers.alarm_of s = None && Store.M.find "value" s.kv = "1");
+  let r = call ~now:1600 "ALARM" "/__alarm/fire" in
+  check "second fire is a no-op" (not r.wrote);
+  (match Store.restore [ Result.get_ok (Celld_ltx.decode ltx) ] with
+  | Ok r -> check "alarm restores with the cell" (Handlers.alarm_of r = Some 1500)
+  | Error e -> check e false);
+  let kvh = Option.get (Handlers.dispatch "Kv:a") in
+  let k = Store.empty () in
+  ignore (kvh k ~now_ms:0 ~meth:"PUT" ~path:"/__alarm" ~query:[ ("at_ms", "5") ] ~body:"");
+  check "kv hides the reserved key"
+    ((kvh k ~now_ms:0 ~meth:"GET" ~path:"/" ~query:[] ~body:"").body = ""
+    && (kvh k ~now_ms:0 ~meth:"GET" ~path:"/\000alarm" ~query:[] ~body:"").status = 400)
