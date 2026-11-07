@@ -217,3 +217,8 @@ dune build @runtest --root . --build-dir _build_all
 - **Idle eviction:** an idle cell is made durable, stopped, and its
   ownership released (`node: ""`). The next request reactivates it at
   epoch+1.
+
+## License
+
+Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). The design and the
+LTX format come from [celld](https://github.com/denoland/celld) (Apache-2.0).

@@ -1,0 +1,11 @@
+celld-ml
+Copyright 2026 Alfonso Campodonico
+
+celld-ml is licensed under the Apache License 2.0; see LICENSE.
+
+celld-ml is an OCaml reimplementation of the architecture of celld
+(https://github.com/denoland/celld), Copyright 2026 Deno Land Inc.,
+licensed under the Apache License 2.0. lib/ltx follows celld's LTX
+format and crates/ltx and was rewritten in OCaml; the protocols in
+lib/logic, lib/wire and unikernels/node follow celld's design. These are
+modified works: none of celld's source is included verbatim.

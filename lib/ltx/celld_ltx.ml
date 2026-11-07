@@ -1,4 +1,6 @@
-(* LTX v3 / ltx v0.5.2, following celld's reference/ltx-format.md. *)
+(* LTX v3 / ltx v0.5.2, following celld's reference/ltx-format.md and
+   crates/ltx (Apache-2.0, Copyright 2026 Deno Land Inc.); modified: rewritten
+   in OCaml. *)
 
 let magic = "LTX1"
 let header_size = 100
