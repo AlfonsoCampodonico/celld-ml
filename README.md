@@ -11,6 +11,112 @@ file. This fork keeps that design and drops the payload: there is no V8,
 Workers runtime or SQLite. Cells are native OCaml handlers (`Counter`, `Kv`)
 over a paged in-memory KV store. See [DESIGN.md](DESIGN.md) for the mapping.
 
+## How it fits together
+
+Every box is its own Solo5 unikernel. Clients can hit any node; the bucket
+is the only shared state.
+
+```mermaid
+flowchart LR
+  client([client])
+  subgraph fleet[nodes]
+    n1["n1<br/>:8080 public<br/>:8081 peer"]
+    n2["n2"]
+    n3["n3"]
+  end
+  bucket[("bucket :9000<br/>nodes/&lt;node&gt;.json<br/>cells/&lt;cell&gt;/own.json<br/>cells/&lt;cell&gt;/ltx/e&lt;epoch&gt;/...")]
+  client -->|"/do/Counter:demo/..."| n2
+  n2 -->|"signed /peer/forward"| n1
+  n1 -->|"/peer/log/append"| n2
+  n1 -->|"/peer/log/append"| n3
+  n1 -->|"lease CAS, own.json CAS,<br/>LTX uploads"| bucket
+  n2 -.-> bucket
+  n3 -.-> bucket
+```
+
+Inside a node, one pure function decides and an actor does the I/O:
+
+```mermaid
+flowchart LR
+  io["actor<br/>(HTTP, bucket, peers, timers)"] -->|event| core["Core.on_event<br/>sans-IO, deterministic"]
+  core -->|"eff list"| io
+  sim["test/sim"] -->|"same events"| core
+```
+
+### A write
+
+The owner commits, ships the LTX entry to its followers, and only answers
+once every follower has acked (fleet proof). The upload to the bucket
+happens afterwards.
+
+```mermaid
+sequenceDiagram
+  participant C as client
+  participant N2 as n2 (not owner)
+  participant N1 as n1 (owner)
+  participant F as followers
+  participant B as bucket
+  C->>N2: POST /do/Counter:demo/increment
+  N2->>B: GET own.json, nodes/n1.json
+  N2->>N1: signed POST /peer/forward
+  N1->>N1: run handler, commit, encode LTX
+  Note over N1: output gate holds the response
+  N1->>F: /peer/log/append (CLA1 batch)
+  F-->>N1: ack
+  N1-->>N2: 200 (write proven)
+  N2-->>C: 200
+  N1-)B: PUT cells/Counter:demo/ltx/e1/... (async)
+```
+
+### Takeover after an owner dies
+
+```mermaid
+sequenceDiagram
+  participant N2 as n2
+  participant B as bucket
+  participant F as n1's followers
+  N2->>B: GET own.json (owner n1, epoch 1)
+  N2->>B: GET nodes/n1.json
+  alt lease still valid
+    Note over N2: n1 still owns the cell, forward or 502
+  else lease expired, log open
+    N2->>B: CAS nodes/n1.json log=recovering
+    N2->>F: /peer/log/seal
+    F-->>N2: unuploaded tail
+    N2->>B: PUT tail as LTX files
+    N2->>B: CAS nodes/n1.json log=sealed
+    N2->>B: CAS own.json If-Match (owner n2, epoch 2)
+    N2->>B: LIST + GET ltx files, restore
+    Note over N2: resident at epoch 2
+  end
+```
+
+### Cell lifecycle on a node
+
+```mermaid
+stateDiagram-v2
+  [*] --> Inactive
+  Inactive --> Reading_owner: request
+  Reading_owner --> Acquiring: unowned, or ours from before
+  Reading_owner --> Reading_lease: owned by another node
+  Reading_lease --> Remote: lease live (forward)
+  Reading_lease --> Recovering_log: lease expired, log open
+  Reading_lease --> Acquiring: lease expired, log sealed
+  Recovering_log --> Acquiring
+  Acquiring --> Reading_owner: CAS rejected or ambiguous
+  Acquiring --> Restoring: CAS applied (epoch + 1)
+  Restoring --> Resident
+  Resident --> Ensuring: idle
+  Ensuring --> Cleaning: durable
+  Cleaning --> Releasing: runtime stopped
+  Releasing --> Inactive: own.json node = ""
+  Remote --> Inactive: lease ends or invalidated
+```
+
+A node that cannot renew `nodes/<node>.json` before it expires halts with
+exit code 3, so a partitioned owner stops serving before anyone else can
+claim its cells.
+
 ## What carries over
 
 - **The sans-IO core.** `Celld_logic.Core.on_event : t -> now_ms:int -> event -> eff list`
