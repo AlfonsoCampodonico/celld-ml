@@ -51,7 +51,9 @@ rebalance, drain, alarms, queues, or cron.
 | `lib/cell` | `celld_cell`: paged KV store, LTX capture/restore, handlers | celld_ltx |
 | `test` | native tests and a deterministic simulator | the pure libs |
 | `unikernels/bucket` | S3-ish object store with CAS, block-backed log | http.mirage, mirage-block |
-| `unikernels/node` | the celld node: actor + effect executor | everything |
+| `lib/blocklog` | `celld_blocklog`: record and superblock framing for the on-disk log | stdlib only |
+| `lib/blocklog/mirage` | `celld_blocklog_mirage`: the log over `Mirage_block.S` | lwt, cstruct, mirage-block |
+| `unikernels/node` | the celld node: actor + effect executor + follower log on a `log` block device | everything |
 
 Each unikernel dir symlinks `lib -> ../../lib`, and `scripts/build.sh` adds
 the local libraries to the generated `dune.build`.

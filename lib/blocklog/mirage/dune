@@ -1,0 +1,4 @@
+(library
+ (name celld_blocklog_mirage)
+ (optional)
+ (libraries celld_blocklog lwt cstruct mirage-block fmt))

@@ -38,7 +38,9 @@ start_bucket() {
 start_node() { # i args...
   local i=$1; shift
   stop_one "n$i"
-  boot "n$i" "tap$i" node "$root/unikernels/node/dist/node.hvt" \
+  # The follower log survives restarts; `up` starts every node with a blank one.
+  [ -f "$run/n$i.img" ] || truncate -s "${LOG_SIZE:-64M}" "$run/n$i.img"
+  boot "n$i" "tap$i" node "--block:log=$run/n$i.img" "$root/unikernels/node/dist/node.hvt" \
     "--ipv4=10.0.0.1$i/24" --ipv4-gateway=10.0.0.1 "--node-id=n$i" "--advertise=10.0.0.1$i:8081" \
     --bucket=10.0.0.2:9000 "$@"
   wait_for "n$i" "celld-ml node"
@@ -57,7 +59,7 @@ case ${1:-} in
   up)
     shift; n=${1:-3}; shift || true
     "$0" down
-    rm -f "$run/bucket.img"
+    rm -f "$run/bucket.img" "$run"/n*.img
     start_bucket
     for i in $(seq 1 "$n"); do start_node "$i" "$@"; done
     ;;

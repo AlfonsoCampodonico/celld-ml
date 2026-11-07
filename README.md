@@ -136,7 +136,8 @@ claim its cells.
   write is proven. Reads trail the newest open barrier on their cell.
 - **Fleet vs bucket proofs.**
   - A fleet proof is an ack from every recruited follower over signed peer
-    HTTP.
+    HTTP. A follower writes the batch to its own block device before it
+    acks, so an acked entry survives the follower restarting.
   - A bucket proof is an upload plus an `own.json` re-read.
 - **The takeover recovery gate.** Before taking over a cell from a dead
   owner whose log is open, the new node:
@@ -160,7 +161,8 @@ GC, WebSockets and the tunnel. A forwarded request is one signed POST.
 | `lib/wire` | JSON records, the `CLA1` log batch, and peer signing helpers |
 | `lib/http`, `lib/http/mirage`, `lib/bucketc` | HTTP/1.1, plus server and client over mirage-tcpip, plus the bucket client |
 | `unikernels/bucket` | an S3-like object store with ETag CAS, persisted to a block device |
-| `unikernels/node` | the node: actor, effect executor, node log, and peer endpoints |
+| `lib/blocklog`, `lib/blocklog/mirage` | a crash-safe record log on a block device: two halves and a superblock, compacted by rewriting the live records into the other half |
+| `unikernels/node` | the node: actor, effect executor, node log, follower log, and peer endpoints |
 | `test/*` | native tests and the simulator |
 
 ## Run it
@@ -211,6 +213,12 @@ dune build @runtest --root . --build-dir _build_all
   lease was still valid. After the lease expired, n2 sealed n1's log on both
   followers, uploaded all 10 entries, claimed epoch 2 and restored the value
   10. No acknowledged write was lost.
+- **Every node crashes at once:** with n1's uploads stalled, 10 writes
+  were acked by n1 and held only by its followers. All three nodes were
+  killed and n2 and n3 restarted. Each replayed its follower log from disk
+  (`holding 10 entries`), and n2 recovered n1's log and restored 10. With
+  a 256 KB log disk and 400 writes, each follower compacted twice and all
+  400 came back.
 - **Partition:** a node cut off from the bucket logged
   `SELF-FENCE: node lease expired` and exited with code 3, and another node
   took over its cell at the next epoch with its state intact.

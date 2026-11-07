@@ -12,6 +12,7 @@ let packages =
     package "mirage-mtime";
     package "mirage-runtime";
     package "mirage-crypto-rng";
+    package "mirage-block";
     package "digestif";
     package "cmdliner";
     package "logs";
@@ -19,6 +20,7 @@ let packages =
     package "ipaddr";
   ]
 
-let main = main ~packages "Unikernel.Make" (stackv4v6 @-> job)
+let main = main ~packages "Unikernel.Make" (stackv4v6 @-> block @-> job)
 let stack = generic_stackv4v6 default_network
-let () = register "node" [ main $ stack ]
+let log = block_of_file "log"
+let () = register "node" [ main $ stack $ log ]

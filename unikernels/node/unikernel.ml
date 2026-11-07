@@ -32,9 +32,10 @@ let upload_delay_ms = arg "upload-delay-ms" "Delay before each LTX upload (to sh
 let public_port = 8080
 let internal_port = 8081
 
-module Make (S : Tcpip.Stack.V4V6) = struct
+module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
   module H = Celld_http_mirage.Make (S)
   module B = Celld_bucketc.Make (S)
+  module D = Celld_blocklog_mirage.Make (Blk)
 
   let now_ms () = int_of_float (Ptime.to_float_s (Mirage_ptime.now ()) *. 1000.)
   let sleep_ms ms = Mirage_sleep.ns (Int64.mul (Int64.of_int (max 0 ms)) 1_000_000L)
@@ -88,6 +89,8 @@ module Make (S : Tcpip.Stack.V4V6) = struct
     mutable active : peer list;  (** followers recorded in our lease and caught up *)
     mutable want : peer list;
     held : (string, held) Hashtbl.t;
+    disk : D.t;  (** follower log: what [held] is rebuilt from after a restart *)
+    disk_lock : Lwt_mutex.t;
     mutable durable_waiters : durable_waiter list;
     completions : (req, (route, request_error) result Lwt.u) Hashtbl.t;
     releases : (req, (unit, request_error) result Lwt.u) Hashtbl.t;
@@ -264,13 +267,66 @@ module Make (S : Tcpip.Stack.V4V6) = struct
           t.mailbox (Followers_chosen want)
         end
 
+  (* ---- the follower log on disk ----
+     A follower writes every batch and every seal to its block device before
+     answering, so an acked entry survives the follower restarting. Records
+     are 'A' ^ CLA1 batch or 'S' ^ leader session, applied in order. When the
+     active half is three quarters full, the live state is rewritten into the
+     other half. *)
+
+  let held_for t session =
+    match Hashtbl.find_opt t.held session with
+    | Some h -> h
+    | None ->
+        let h = { sealed = false; entries = Hashtbl.create 64 } in
+        Hashtbl.replace t.held session h;
+        h
+
+  let apply_batch t (b : Wire.batch) =
+    let h = held_for t b.leader in
+    List.iter (fun (e : Wire.entry) -> Hashtbl.replace h.entries e.seq e) b.entries;
+    (* The leader only acknowledges what is still untiered. *)
+    Hashtbl.filter_map_inplace (fun seq e -> if seq < b.truncate_to then None else Some e) h.entries
+
+  let apply_record t r =
+    let body = String.sub r 1 (String.length r - 1) in
+    match r.[0] with
+    | 'A' -> ( match Wire.decode_batch body with Ok b -> apply_batch t b | Error e -> Log.warn (fun m -> m "follower log: bad batch: %s" e))
+    | 'S' -> (held_for t body).sealed <- true
+    | _ -> Log.warn (fun m -> m "follower log: unknown record")
+
+  let live_records t =
+    Hashtbl.fold
+      (fun session h acc ->
+        let entries = List.sort (fun (a : Wire.entry) b -> compare a.seq b.seq) (Hashtbl.fold (fun _ e l -> e :: l) h.entries []) in
+        let a = if entries = [] then [] else [ "A" ^ Wire.encode_batch { leader = session; truncate_to = 0; entries } ] in
+        let s = if h.sealed then [ "S" ^ session ] else [] in
+        a @ s @ acc)
+      t.held []
+
+  (* Persist [record], then run [k] under the same lock, so memory changes
+     in the order the disk records them. *)
+  let persisted t record k =
+    Lwt_mutex.with_lock t.disk_lock (fun () ->
+        Lwt.catch
+          (fun () ->
+            (if D.used t.disk + String.length record + 32 > D.capacity t.disk * 3 / 4 then begin
+               let live = live_records t in
+               Log.info (fun m -> m "follower log: compacting %d bytes into %d records" (D.used t.disk) (List.length live));
+               D.rewrite t.disk live
+             end
+             else Lwt.return_unit)
+            >>= fun () -> D.append t.disk record >|= fun () -> Ok (k ()))
+          (fun exn -> Lwt.return (Error (Printexc.to_string exn))))
+
   (* ---- takeover recovery gate (celld's recover_serial) ----
      CAS the dead log to recovering, seal its followers, upload their tails,
      CAS it to sealed. Returns the record's final etag. *)
   let seal_local t session =
-    let h = match Hashtbl.find_opt t.held session with Some h -> h | None -> let h = { sealed = false; entries = Hashtbl.create 8 } in Hashtbl.replace t.held session h; h in
-    h.sealed <- true;
-    Hashtbl.fold (fun _ e acc -> e :: acc) h.entries []
+    persisted t ("S" ^ session) (fun () ->
+        let h = held_for t session in
+        h.sealed <- true;
+        Hashtbl.fold (fun _ e acc -> e :: acc) h.entries [])
 
   let recover t (l : lease) : (string, failure) result Lwt.t =
     let cas guard l = B.put t.bucket (Wire.lease_key l.l_node) ~guard:(B.Match guard) (Wire.lease_to_json l) in
@@ -287,7 +343,7 @@ module Make (S : Tcpip.Stack.V4V6) = struct
     | Ok (`Ok etag) ->
         Lwt_list.map_p
           (fun (p : peer) ->
-            if p.p_node = t.me then Lwt.return (Some (seal_local t l.l_session))
+            if p.p_node = t.me then seal_local t l.l_session >|= Result.to_option
             else
               peer_call t p.p_addr ~meth:"POST" ~path:"/peer/log/seal" (Wire.to_string (Wire.Obj [ ("session", Wire.Str l.l_session) ]))
               >|= function
@@ -569,26 +625,25 @@ module Make (S : Tcpip.Stack.V4V6) = struct
         | "POST", "/peer/log/append" -> (
             match Wire.decode_batch r.body with
             | Error e -> Lwt.return (text 400 (e ^ "\n"))
-            | Ok b ->
-                let h =
-                  match Hashtbl.find_opt t.held b.leader with
-                  | Some h -> h
-                  | None -> let h = { sealed = false; entries = Hashtbl.create 64 } in Hashtbl.replace t.held b.leader h; h
-                in
-                if h.sealed then Lwt.return (text 409 "sealed\n")
-                else begin
-                  List.iter (fun (e : Wire.entry) -> Hashtbl.replace h.entries e.seq e) b.entries;
-                  (* The leader only acknowledges what is still untiered. *)
-                  Hashtbl.filter_map_inplace (fun seq e -> if seq < b.truncate_to then None else Some e) h.entries;
-                  Lwt.return (text 200 (Printf.sprintf "{\"ok\":true,\"end\":%d}\n" (List.fold_left (fun a (e : Wire.entry) -> max a e.seq) 0 b.entries)))
-                end)
+            | Ok b -> (
+                if (held_for t b.leader).sealed then Lwt.return (text 409 "sealed\n")
+                else
+                  (* Sealing takes the same lock, so this re-check is final. *)
+                  persisted t ("A" ^ r.body) (fun () ->
+                      if (held_for t b.leader).sealed then false else (apply_batch t b; true))
+                  >|= function
+                  | Ok true -> text 200 (Printf.sprintf "{\"ok\":true,\"end\":%d}\n" (List.fold_left (fun a (e : Wire.entry) -> max a e.seq) 0 b.entries))
+                  | Ok false -> text 409 "sealed\n"
+                  | Error e -> text 503 ("follower log write failed: " ^ e ^ "\n")))
         | "POST", "/peer/log/seal" -> (
             match Wire.of_string r.body with
             | Ok j ->
                 let session = Wire.str_field "session" j in
-                let entries = seal_local t session in
-                Log.info (fun m -> m "sealed log %s for %s (%d entries)" session source (List.length entries));
-                Lwt.return { Celld_http.status = 200; headers = []; body = Wire.encode_batch { leader = session; truncate_to = 0; entries } }
+                (seal_local t session >|= function
+                 | Ok entries ->
+                     Log.info (fun m -> m "sealed log %s for %s (%d entries)" session source (List.length entries));
+                     { Celld_http.status = 200; headers = []; body = Wire.encode_batch { leader = session; truncate_to = 0; entries } }
+                 | Error e -> text 503 ("follower log write failed: " ^ e ^ "\n"))
             | Error e -> Lwt.return (text 400 (e ^ "\n")))
         | _ -> Lwt.return (text 404 "unknown peer endpoint\n"))
 
@@ -603,8 +658,9 @@ module Make (S : Tcpip.Stack.V4V6) = struct
         | _ -> peer_secret bucket)
     | Error _ -> sleep_ms 500 >>= fun () -> peer_secret bucket
 
-  let start stack =
+  let start stack blk =
     let me = node_id () in
+    D.open_ blk >>= fun (disk, records) ->
     let bip, bport = parse_addr (bucket_addr ()) in
     let bucket = B.create stack bip bport in
     let session = random_hex 8 in
@@ -623,6 +679,8 @@ module Make (S : Tcpip.Stack.V4V6) = struct
         active = [];
         want = [];
         held = Hashtbl.create 4;
+        disk;
+        disk_lock = Lwt_mutex.create ();
         durable_waiters = [];
         completions = Hashtbl.create 64;
         releases = Hashtbl.create 64;
@@ -630,6 +688,11 @@ module Make (S : Tcpip.Stack.V4V6) = struct
         nonces = Hashtbl.create 64;
       }
     in
+    List.iter (apply_record t) records;
+    if records <> [] then
+      Log.info (fun m ->
+          m "follower log: replayed %d records, holding %d entries for %d leaders" (List.length records)
+            (Hashtbl.fold (fun _ h n -> n + Hashtbl.length h.entries) t.held 0) (Hashtbl.length t.held));
     Log.info (fun m -> m "celld-ml node %s session %s, bucket %s, durability %s" me session (bucket_addr ()) (durability ()));
     peer_secret bucket >>= fun secret ->
     t.secret <- secret;
