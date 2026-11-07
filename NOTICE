@@ -15,4 +15,6 @@ lib/sqlite/sqlite3.c and sqlite3.h are the SQLite 3.54.1 amalgamation
 
 lib/js/quickjs is the QuickJS engine, release 2026-06-04
 (https://bellard.org/quickjs), Copyright (c) 2017-2021 Fabrice Bellard and
-Charlie Gordon, under the MIT License; see lib/js/quickjs/LICENSE.
+Charlie Gordon, under the MIT License; see lib/js/quickjs/LICENSE. One
+line of quickjs.c is modified, marked "celld-ml": Atomics can be turned
+off with CELLD_NO_ATOMICS.

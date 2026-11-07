@@ -1,4 +1,5 @@
-/* JS cells on QuickJS: one runtime per node, one context per resident cell.
+/* JS cells on QuickJS: one runtime and one context per resident cell, so
+   cells share no heap, no memory limit and no job queue.
 
    A context evaluates a prelude (Request, Response, ctx.storage) and then
    the class script. Calls go through the prelude's __celld_dispatch, which
@@ -22,38 +23,49 @@
 extern sqlite3 *celld_sql_handle(value conn);
 extern void celld_sql_reset_budget(void);
 
-#define MEMORY_LIMIT ((size_t)64 << 20)
-#define STACK_LIMIT ((size_t)512 << 10)
+#define MEMORY_LIMIT ((size_t)32 << 20) /* per cell */
+#define STACK_LIMIT ((size_t)256 << 10)
 #define CALL_BUDGET 20000 /* interrupt checks per call */
 
-static JSRuntime *rt = NULL;
-static int budget = CALL_BUDGET;
+struct cell {
+  JSRuntime *rt;
+  JSContext *ctx;
+  sqlite3 *db; /* NULL once disposed */
+  int budget;
+};
 
 static int on_interrupt(JSRuntime *r, void *opaque) {
-  (void)r; (void)opaque;
-  return --budget <= 0;
+  (void)r;
+  struct cell *c = opaque;
+  return --c->budget <= 0;
 }
 
-static JSRuntime *runtime(void) {
-  if (!rt) {
-    rt = JS_NewRuntime();
-    if (!rt) caml_failwith("js: cannot create runtime");
-    JS_SetMemoryLimit(rt, MEMORY_LIMIT);
-    JS_SetMaxStackSize(rt, STACK_LIMIT);
-    JS_SetInterruptHandler(rt, on_interrupt, NULL);
-  }
-  return rt;
+/* Every entry into JS: a fresh budget, and the stack top measured from
+   here, since calls arrive at different depths of the OCaml stack. */
+static void enter(struct cell *c) {
+  c->budget = CALL_BUDGET;
+  JS_UpdateStackTop(c->rt);
 }
 
-struct cell {
-  JSContext *ctx;
-  sqlite3 *db;
-};
+/* Run queued jobs to completion. After a failure the rest still run (on a
+   spent budget they stop fast), so nothing is left for the next call. */
+static int drain(struct cell *c, JSContext **failed) {
+  JSContext *jctx;
+  int rc, ok = 1;
+  while ((rc = JS_ExecutePendingJob(c->rt, &jctx)) != 0)
+    if (rc < 0 && ok) { ok = 0; *failed = jctx; }
+  return ok;
+}
 
 #define Cell_val(v) (*((struct cell **)Data_custom_val(v)))
 
 static void cell_free(struct cell *c) {
-  if (c->ctx) JS_FreeContext(c->ctx);
+  c->db = NULL;
+  if (c->ctx) {
+    JS_SetContextOpaque(c->ctx, NULL);
+    JS_FreeContext(c->ctx);
+  }
+  if (c->rt) JS_FreeRuntime(c->rt);
   free(c);
 }
 
@@ -103,6 +115,7 @@ static value error_of(char *msg) {
 static JSValue js_sql_exec(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   (void)this_val;
   struct cell *c = JS_GetContextOpaque(ctx);
+  if (!c || !c->db) return JS_ThrowTypeError(ctx, "storage is no longer available");
   if (argc < 1) return JS_ThrowTypeError(ctx, "sql.exec(query, ...bindings)");
   size_t qlen;
   const char *q = JS_ToCStringLen(ctx, &qlen, argv[0]);
@@ -166,8 +179,9 @@ static JSValue js_sql_exec(JSContext *ctx, JSValueConst this_val, int argc, JSVa
   return rows;
 }
 
-static int eval(JSContext *ctx, value src, const char *name) {
-  budget = CALL_BUDGET;
+static int eval(struct cell *c, value src, const char *name) {
+  JSContext *ctx = c->ctx;
+  enter(c);
   JSValue v = JS_Eval(ctx, String_val(src), caml_string_length(src), name, JS_EVAL_TYPE_GLOBAL);
   if (JS_IsException(v)) return 0;
   JS_FreeValue(ctx, v);
@@ -181,13 +195,19 @@ CAMLprim value celld_js_create(value prelude, value script, value conn) {
   struct cell *c = calloc(1, sizeof *c);
   if (!c) caml_raise_out_of_memory();
   c->db = celld_sql_handle(conn);
-  c->ctx = JS_NewContext(runtime());
-  if (!c->ctx) { free(c); CAMLreturn(error_of(NULL)); }
+  c->rt = JS_NewRuntime();
+  if (!c->rt) { free(c); CAMLreturn(error_of(NULL)); }
+  JS_SetMemoryLimit(c->rt, MEMORY_LIMIT);
+  JS_SetMaxStackSize(c->rt, STACK_LIMIT);
+  JS_SetInterruptHandler(c->rt, on_interrupt, c);
+  enter(c);
+  c->ctx = JS_NewContext(c->rt);
+  if (!c->ctx) { cell_free(c); CAMLreturn(error_of(NULL)); }
   JS_SetContextOpaque(c->ctx, c);
   JSValue g = JS_GetGlobalObject(c->ctx);
   JS_SetPropertyStr(c->ctx, g, "__celld_sql_exec", JS_NewCFunction(c->ctx, js_sql_exec, "__celld_sql_exec", 2));
   JS_FreeValue(c->ctx, g);
-  if (!eval(c->ctx, prelude, "prelude.js") || !eval(c->ctx, script, "class.js")) {
+  if (!eval(c, prelude, "prelude.js") || !eval(c, script, "class.js")) {
     char *msg = exception_text(c->ctx);
     cell_free(c);
     CAMLreturn(error_of(msg));
@@ -206,7 +226,7 @@ CAMLprim value celld_js_call(value cv, value name, value req) {
   struct cell *c = Cell_val(cv);
   if (!c) caml_failwith("js: cell disposed");
   JSContext *ctx = c->ctx;
-  budget = CALL_BUDGET;
+  enter(c);
   JSValue g = JS_GetGlobalObject(ctx);
   JSValue fn = JS_GetPropertyStr(ctx, g, "__celld_dispatch");
   JSValue args[2] = { JS_NewString(ctx, String_val(name)),
@@ -216,13 +236,15 @@ CAMLprim value celld_js_call(value cv, value name, value req) {
   JS_FreeValue(ctx, args[1]);
   JS_FreeValue(ctx, fn);
   JS_FreeValue(ctx, g);
-  if (JS_IsException(p)) CAMLreturn(error_of(exception_text(ctx)));
-  JSContext *jctx;
-  int jobs;
-  while ((jobs = JS_ExecutePendingJob(rt, &jctx)) > 0) {}
-  if (jobs < 0) {
+  JSContext *failed = NULL;
+  if (JS_IsException(p)) {
+    char *msg = exception_text(ctx);
+    drain(c, &failed);
+    CAMLreturn(error_of(msg));
+  }
+  if (!drain(c, &failed)) {
     JS_FreeValue(ctx, p);
-    CAMLreturn(error_of(exception_text(jctx)));
+    CAMLreturn(error_of(exception_text(failed)));
   }
   JSValue out;
   switch (JS_PromiseState(ctx, p)) {

@@ -68,7 +68,9 @@
 
 /* define to include Atomics.* operations which depend on the OS
    threads */
-#if !defined(__EMSCRIPTEN__)
+/* celld-ml: CELLD_NO_ATOMICS turns them off without the rest of the
+   Emscripten configuration (Solo5 has no threads). */
+#if !defined(__EMSCRIPTEN__) && !defined(CELLD_NO_ATOMICS)
 #define CONFIG_ATOMICS
 #endif
 

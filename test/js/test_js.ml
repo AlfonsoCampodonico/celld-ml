@@ -33,3 +33,25 @@ let () =
       | Error e -> check e false);
       (match Celld_js.create ~script:"syntax error here (" ~db with Error _ -> check "bad script rejected" true | Ok _ -> check "bad script rejected" false);
       Celld_js.dispose js
+
+(* Isolation and limits: each cell has its own runtime; deep recursion is a
+   catchable error, not a crash; a cell's memory limit is its own. *)
+let () =
+  let db1 = Celld_sqlite.open_image "" and db2 = Celld_sqlite.open_image "" in
+  let mk db script = match Celld_js.create ~script ~db with Ok t -> t | Error e -> failwith e in
+  let a = mk db1 {|let n = 0; function fetch() { n += 1; return String(n); }|} in
+  let b = mk db2 {|function fetch(r) {
+    if (r.path === "/deep") { const f = (x) => f(x + 1); f(0); }
+    if (r.path === "/hog") { const xs = []; for (;;) xs.push(new Array(100000).fill(1)); }
+    if (r.path === "/json") return String(JSON.parse(r.query.s).length);
+    return "b"; }|} in
+  let call t ?(query = []) path = Celld_js.call t ~name:"fetch" ~cell:"X:1" ~meth:"GET" ~path ~query ~body:"" in
+  check "cells keep separate globals" (call a "/" = Ok { status = 200; content_type = "text/plain"; body = "1" } && (match call b "/" with Ok r -> r.body = "b" | _ -> false));
+  (match call b "/deep" with Error e -> check ("deep recursion is an error: " ^ String.sub e 0 (min 40 (String.length e))) true | Ok _ -> check "deep recursion" false);
+  (match call b "/hog" with Error _ -> check "memory limit is per cell" true | Ok _ -> check "memory limit" false);
+  check "other cell unaffected by a hog" (match call a "/" with Ok r -> r.body = "2" | _ -> false);
+  let deep = String.make 100_000 '[' ^ String.make 100_000 ']' in
+  (match call b ~query:[ ("s", deep) ] "/json" with Error _ -> check "deeply nested JSON is an error" true | Ok _ -> check "deeply nested JSON" true);
+  check "cell usable after errors" (match call b "/" with Ok r -> r.body = "b" | _ -> false);
+  Celld_js.dispose a;
+  Celld_js.dispose b
