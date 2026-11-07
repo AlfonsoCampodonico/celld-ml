@@ -188,6 +188,15 @@ claim its cells.
   alarm handler (Counter ticks, Kv counts firings). The bucket index
   `alarms/<cell>` lets any node wake a cell that was evicted or whose
   owner died. A fire that finds nothing due is a no-op.
+- **Any S3-compatible bucket, over TLS.** `--bucket=s3://IP:PORT/BUCKET`
+  makes the nodes use a real object store instead of the bucket unikernel.
+  Requests are path-style and SigV4-signed (`--s3-access-key`,
+  `--s3-secret-key`, `--s3-region`), listing uses ListObjectsV2, and
+  ownership still rests on `If-None-Match: *` and `If-Match` on PUT, which
+  S3 and its clones now support. `--s3-tls=true` uses TLS (ocaml-tls).
+  The certificate is checked against the Mozilla root store, or pinned
+  with `--s3-tls-fingerprint`. The unikernel has no DNS, so the endpoint is
+  an IP and `--s3-host` sets the Host header and TLS name.
 - **Signed peer HTTP.** Requests are HMAC-SHA256-signed with a fleet secret
   that is created once with a conditional write.
 
@@ -200,6 +209,7 @@ The fork leaves out queues, cron, WebSockets and the tunnel. A forwarded request
 | `lib/logic` | the core: types, phases, `on_event` |
 | `lib/ltx` | the LTX format, CRC-64, and an LZ4 block codec written from the format spec |
 | `lib/cell` | the page store (KV or SQLite), capture, restore planning, GC, and the cell classes |
+| `lib/s3` | SigV4 signing (checked against AWS's published examples), key encoding, ListObjectsV2 parsing |
 | `lib/js` | the vendored QuickJS engine (2026-06-04), the Solo5 shims it needs, and the JS cell runtime: prelude, storage binding, budgets |
 | `lib/sqlite` | the vendored SQLite amalgamation, an in-memory VFS with dirty-page tracking, and the OCaml binding |
 | `lib/wire` | JSON records, the `CLA1` log batch, and peer signing helpers |
@@ -229,6 +239,12 @@ curl http://10.0.0.12:8080/do/Counter:demo          # forwarded to the owner
 curl -X PUT --data-binary hi http://10.0.0.13:8080/do/Kv:cfg/greeting
 curl http://10.0.0.11:8080/state
 scripts/fleet.sh down
+```
+
+Against an S3-compatible store instead of the bucket unikernel:
+
+```bash
+NODE_BUCKET=s3://10.0.0.1:9100/celld NODE_ARGS="--s3-access-key=KEY --s3-secret-key=SECRET" scripts/fleet.sh up 3
 ```
 
 `build.sh` patches two vendored dependencies:
@@ -279,6 +295,11 @@ dune build @runtest --root . --build-dir _build_all
   throw left no row behind, the JS alarm ran, and after the owner was
   killed the next node restored the room with its messages, KV entries and
   alarm count.
+- **S3 and TLS:** with moto's S3 server as the bucket (MinIO's community
+  build is no longer distributed), the fleet ran writes, compaction and GC,
+  an alarm, a JS class and a takeover with no state lost. The same ran over
+  HTTPS with a pinned certificate. A node given the wrong pin refused the
+  store (`authentication failure: fingerprint`) and served nothing.
 - **Alarms:** an alarm fired on its owner's timer, an alarm on a cell
   evicted 5 s earlier woke it at e2 and fired once, and an alarm whose
   owner was killed fired on the node that took over. The `alarms/` index
