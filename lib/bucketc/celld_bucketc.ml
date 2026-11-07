@@ -24,21 +24,31 @@ module Make (S : Tcpip.Stack.V4V6) = struct
 
   (* Certificates: a pinned SHA-256 certificate fingerprint (hex), or the
      Mozilla NSS root store. *)
+  (* The DNS name in [host] without a port, if it is one. *)
+  let dns_name host =
+    let name = match String.rindex_opt host ':' with Some i when not (String.contains host ']') -> String.sub host 0 i | _ -> host in
+    match Domain_name.of_string name with Ok d -> Result.to_option (Domain_name.host d) | Error _ -> None
+
   let tls_config ?fingerprint ~host () =
     let time () = Some (Mirage_ptime.now ()) in
     let authenticator =
       match fingerprint with
       | Some hex ->
           let hex = String.concat "" (String.split_on_char ':' (String.lowercase_ascii hex)) in
-          let raw = String.init (String.length hex / 2) (fun i -> Char.chr (int_of_string ("0x" ^ String.sub hex (2 * i) 2))) in
-          Ok (X509.Authenticator.cert_fingerprint ~time ~hash:`SHA256 ~fingerprint:raw)
+          if String.length hex <> 64 || not (String.for_all (function '0' .. '9' | 'a' .. 'f' -> true | _ -> false) hex) then
+            Error (`Msg "the fingerprint must be 64 hex digits (SHA-256)")
+          else
+            let raw = String.init 32 (fun i -> Char.chr (int_of_string ("0x" ^ String.sub hex (2 * i) 2))) in
+            Ok (X509.Authenticator.cert_fingerprint ~time ~hash:`SHA256 ~fingerprint:raw)
       | None -> Ca_certs_nss.authenticator ()
     in
-    match authenticator with
-    | Error (`Msg m) -> Error m
-    | Ok authenticator ->
-        let peer_name = match Domain_name.of_string host with Ok d -> Result.to_option (Domain_name.host d) | Error _ -> None in
-        Result.map_error (fun (`Msg m) -> m) (Tls.Config.client ~authenticator ?peer_name ())
+    match authenticator, dns_name host with
+    | Error (`Msg m), _ -> Error m
+    (* A CA chain proves only that the certificate names some host: without
+       a name to check it against, any publicly trusted certificate would do. *)
+    | Ok _, None when fingerprint = None ->
+        Error "TLS without a pinned fingerprint needs a DNS name in --s3-host to verify the certificate against"
+    | Ok authenticator, peer_name -> Result.map_error (fun (`Msg m) -> m) (Tls.Config.client ~authenticator ?peer_name ())
 
   let connect t () =
     match t.tls with
@@ -47,7 +57,7 @@ module Make (S : Tcpip.Stack.V4V6) = struct
         S.TCP.create_connection (S.tcp t.stack) (t.ip, t.port) >>= function
         | Error e -> Lwt.return (Error (Fmt.str "%a" S.TCP.pp_error e))
         | Ok flow -> (
-            let host = match Domain_name.of_string (List.hd (String.split_on_char ':' t.host)) with Ok d -> Result.to_option (Domain_name.host d) | Error _ -> None in
+            let host = dns_name t.host in
             Tls_flow.client_of_flow config ?host flow >|= function
             | Error e -> Error (Fmt.str "tls: %a" Tls_flow.pp_write_error e)
             | Ok tls ->

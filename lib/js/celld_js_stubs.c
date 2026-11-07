@@ -11,6 +11,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include "quickjs.h"
 #include "sqlite3.h"
 
@@ -41,8 +42,13 @@ struct cell {
    16-byte alignment. */
 #define HDR 16
 
+/* Every check is written so it cannot overflow: [size] comes from scripts. */
+static int cm_fits(JSMallocState *s, size_t extra) {
+  return extra <= s->malloc_limit && s->malloc_size <= s->malloc_limit - extra;
+}
+
 static void *cm_malloc(JSMallocState *s, size_t size) {
-  if (s->malloc_size + size + HDR > s->malloc_limit) return NULL;
+  if (size > SIZE_MAX - HDR || !cm_fits(s, size + HDR)) return NULL;
   unsigned char *p = malloc(size + HDR);
   if (!p) return NULL;
   *(size_t *)p = size;
@@ -66,7 +72,7 @@ static void *cm_realloc(JSMallocState *s, void *ptr, size_t size) {
   if (!ptr) return size ? cm_malloc(s, size) : NULL;
   if (size == 0) { cm_free(s, ptr); return NULL; }
   size_t old = cm_usable(ptr);
-  if (size > old && s->malloc_size + (size - old) > s->malloc_limit) return NULL;
+  if (size > SIZE_MAX - HDR || (size > old && !cm_fits(s, size - old))) return NULL;
   unsigned char *p = realloc((unsigned char *)ptr - HDR, size + HDR);
   if (!p) return NULL;
   *(size_t *)p = size;
