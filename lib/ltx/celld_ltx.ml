@@ -1,5 +1,4 @@
-(* LTX v3 / ltx v0.5.2, ported from celld's crates/ltx (ltx.rs, codec.rs,
-   lz4_block.rs) and reference/ltx-format.md. *)
+(* LTX v3 / ltx v0.5.2, following celld's reference/ltx-format.md. *)
 
 let magic = "LTX1"
 let header_size = 100
@@ -164,218 +163,142 @@ let decode_header s =
 
 (* ── LZ4 block ───────────────────────────────────────────────────────────── *)
 
+(* An LZ4 block codec written from the public block format description
+   (lz4_Block_format.md). A block is a run of sequences: a token (literal
+   length in the high nibble, match length - 4 in the low nibble, 15 meaning
+   "more length bytes follow"), the literals, a 2-byte little-endian offset
+   and the extra match length. The last sequence has literals only. Encoders
+   must leave the last 5 bytes as literals and start no match within the
+   last 12 bytes. *)
 module Lz4 = struct
   let min_match = 4
-  let window_size = 1 lsl 16
-  let window_mask = window_size - 1
-  let hash_log = 16
-  let hash_size = 1 lsl hash_log
-  let match_find_limit = 10 + min_match
+  let last_literals = 5
+  let match_limit = 12
+  let max_offset = 0xffff
+  let hash_bits = 14
   let compress_bound n = n + (n / 255) + 16
-  let prime_6_bytes = 227_718_039_650_203L
 
-  let block_hash v =
-    Int64.to_int
-      (Int64.shift_right_logical (Int64.mul (Int64.shift_left v 16) prime_6_bytes) (64 - hash_log))
+  (* Multiplicative (Fibonacci) hash of the 4 bytes at [i]. *)
+  let hash4 s i =
+    let v = Int32.to_int (String.get_int32_le s i) land 0xffff_ffff in
+    ((v * 0x9e37_79b1) land 0xffff_ffff) lsr (32 - hash_bits)
 
-  (* Port of pierrec/lz4 v4.1.23 CompressBlock (via celld's lz4_block.rs).
-     The hash table holds 16-bit positions; [in_use] marks live slots. *)
+  (* Greedy single-probe matcher: each position remembers where its 4-byte
+     prefix was last seen; a hit is extended both ways. Misses advance
+     faster the longer the current literal run gets. *)
   let compress src =
     let n = String.length src in
-    let table = Bytes.create (2 * hash_size) in
-    let in_use = Bytes.make (hash_size / 8) '\000' in
-    let get hash si =
-      let h = hash land (hash_size - 1) in
-      let pos =
-        if Char.code (Bytes.unsafe_get in_use (h lsr 3)) land (1 lsl (h land 7)) <> 0 then
-          Bytes.get_uint16_le table (2 * h)
-        else 0
-      in
-      let pos = pos + (si land lnot window_mask) in
-      if pos >= si then pos - window_size else pos
+    let out = Bytes.create (compress_bound n) in
+    let o = ref 0 in
+    let put b =
+      Bytes.unsafe_set out !o (Char.unsafe_chr b);
+      incr o
     in
-    let put hash si =
-      let h = hash land (hash_size - 1) in
-      Bytes.set_uint16_le table (2 * h) (si land 0xffff);
-      let i = h lsr 3 in
-      Bytes.unsafe_set in_use i
-        (Char.unsafe_chr (Char.code (Bytes.unsafe_get in_use i) lor (1 lsl (h land 7))))
-    in
-    let matches_at value reference offset =
-      offset > 0 && offset < window_size && reference >= 0
-      && Int64.to_int32 value = String.get_int32_le src reference
-    in
-    let dst = Bytes.create (compress_bound n) in
-    let di = ref 0 in
-    let byte v =
-      Bytes.unsafe_set dst !di (Char.unsafe_chr v);
-      incr di
-    in
-    let write_length len =
+    let put_extra len =
+      (* [len] is what is left after the nibble's 15. *)
       let len = ref len in
-      while !len >= 0xff do
-        byte 0xff;
-        len := !len - 0xff
+      while !len >= 255 do
+        put 255;
+        len := !len - 255
       done;
-      byte !len
+      put !len
     in
-    let si = ref 0 and anchor = ref 0 in
-    let sn = if n > match_find_limit then n - match_find_limit else 0 in
-    (if n > match_find_limit then
-       try
-         while !si < sn do
-           let matched = String.get_int64_le src !si in
-           let hash = block_hash matched in
-           let hash2 = block_hash (Int64.shift_right_logical matched 8) in
-           let reference = ref (get hash !si) in
-           let reference2 = get hash2 (!si + 1) in
-           put hash !si;
-           put hash2 (!si + 1);
-           let offset = ref (!si - !reference) in
-           let found =
-             if matches_at matched !reference !offset then true
-             else begin
-               let hash3 = block_hash (Int64.shift_right_logical matched 16) in
-               let reference3 = get hash3 (!si + 2) in
-               incr si;
-               reference := reference2;
-               offset := !si - !reference;
-               if matches_at (Int64.shift_right_logical matched 8) !reference !offset then true
-               else begin
-                 incr si;
-                 reference := reference3;
-                 offset := !si - !reference;
-                 put hash3 !si;
-                 if matches_at (Int64.shift_right_logical matched 16) !reference !offset then true
-                 else begin
-                   si := !si + 2 + ((!si - !anchor) lsr 7);
-                   false
-                 end
-               end
-             end
-           in
-           if found then begin
-             let offset = !offset in
-             let literal_len = ref (!si - !anchor) in
-             let match_len = ref min_match in
-             let target = ref (!si - offset - 1) in
-             while
-               !literal_len > 0 && !target >= 0
-               && String.unsafe_get src (!si - 1) = String.unsafe_get src !target
-             do
-               decr si;
-               decr target;
-               decr literal_len;
-               incr match_len
-             done;
-             let match_base = !si + min_match in
-             si := !si + !match_len;
-             (try
-                while !si + 8 <= sn do
-                  let k = ref 0 in
-                  while
-                    !k < 8 && String.unsafe_get src (!si + !k) = String.unsafe_get src (!si - offset + !k)
-                  do
-                    incr k
-                  done;
-                  si := !si + !k;
-                  if !k < 8 then raise Exit
-                done
-              with Exit -> ());
-             let match_len = !si - match_base in
-             let literal_len = !literal_len in
-             let token_offset = !di in
-             byte (min match_len 0x0f);
-             if literal_len < 0x0f then
-               Bytes.unsafe_set dst token_offset
-                 (Char.unsafe_chr (Char.code (Bytes.get dst token_offset) lor (literal_len lsl 4)))
-             else begin
-               Bytes.unsafe_set dst token_offset
-                 (Char.unsafe_chr (Char.code (Bytes.get dst token_offset) lor 0xf0));
-               write_length (literal_len - 0x0f)
-             end;
-             Bytes.blit_string src !anchor dst !di literal_len;
-             di := !di + literal_len;
-             Bytes.set_uint16_le dst !di offset;
-             di := !di + 2;
-             anchor := !si;
-             if match_len >= 0x0f then write_length (match_len - 0x0f);
-             if !si >= sn then raise Exit;
-             put (block_hash (String.get_int64_le src (!si - 2))) (!si - 2)
-           end
-         done
-       with Exit -> ());
-    let literal_len = n - !anchor in
-    if literal_len < 0x0f then byte (literal_len lsl 4)
-    else begin
-      byte 0xf0;
-      let l = ref literal_len in
-      while !l >= 0xff + 0x0f do
-        byte 0xff;
-        l := !l - 0xff
-      done;
-      byte (!l - 0x0f)
+    let sequence ~lit_from ~lit_len ~matched =
+      let lit_nib = min lit_len 15 in
+      let m_nib = match matched with None -> 0 | Some (_, len) -> min (len - min_match) 15 in
+      put ((lit_nib lsl 4) lor m_nib);
+      if lit_len >= 15 then put_extra (lit_len - 15);
+      Bytes.blit_string src lit_from out !o lit_len;
+      o := !o + lit_len;
+      match matched with
+      | None -> ()
+      | Some (offset, len) ->
+          put (offset land 0xff);
+          put (offset lsr 8);
+          if len - min_match >= 15 then put_extra (len - min_match - 15)
+    in
+    let anchor = ref 0 in
+    if n > match_limit then begin
+      let seen = Array.make (1 lsl hash_bits) (-1) in
+      let last_start = n - match_limit and match_end = n - last_literals in
+      let i = ref 0 in
+      while !i <= last_start do
+        let h = hash4 src !i in
+        let cand = seen.(h) in
+        seen.(h) <- !i;
+        if cand >= 0 && !i - cand <= max_offset
+           && String.get_int32_le src cand = String.get_int32_le src !i
+        then begin
+          let start = ref !i and from = ref cand in
+          while !start > !anchor && !from > 0 && src.[!start - 1] = src.[!from - 1] do
+            decr start;
+            decr from
+          done;
+          let stop = ref (!i + min_match) in
+          while !stop < match_end && src.[!stop] = src.[!stop - (!i - cand)] do
+            incr stop
+          done;
+          sequence ~lit_from:!anchor ~lit_len:(!start - !anchor)
+            ~matched:(Some (!i - cand, !stop - !start));
+          anchor := !stop;
+          i := !stop;
+          if !i - 2 >= 0 && !i - 2 <= last_start then seen.(hash4 src (!i - 2)) <- !i - 2
+        end
+        else i := !i + 1 + ((!i - !anchor) lsr 6)
+      done
     end;
-    Bytes.blit_string src !anchor dst !di literal_len;
-    di := !di + literal_len;
-    Bytes.sub_string dst 0 !di
+    sequence ~lit_from:!anchor ~lit_len:(n - !anchor) ~matched:None;
+    Bytes.sub_string out 0 !o
 
-  exception Bad of string
+  exception Malformed of string
 
   let decompress src ~max_len =
     let n = String.length src in
     let out = Bytes.create (max 0 max_len) in
-    let op = ref 0 and ip = ref 0 in
-    let next () =
-      if !ip >= n then raise (Bad "lz4: truncated input");
-      let c = Char.code (String.unsafe_get src !ip) in
-      incr ip;
-      c
+    let o = ref 0 and p = ref 0 in
+    let fail m = raise (Malformed ("lz4: " ^ m)) in
+    let byte () =
+      if !p >= n then fail "truncated input";
+      let b = Char.code src.[!p] in
+      incr p;
+      b
     in
-    let ext_len base =
-      if base < 15 then base
-      else begin
-        let len = ref base and continue = ref true in
-        while !continue do
-          let b = next () in
-          len := !len + b;
-          if !len > max_len + 0xffff then raise (Bad "lz4: length overflow");
-          if b <> 0xff then continue := false
-        done;
-        !len
-      end
+    let length nibble =
+      let rec more acc =
+        if acc > max_len + 0xffff then fail "length overflow";
+        let b = byte () in
+        if b = 255 then more (acc + 255) else acc + b
+      in
+      if nibble = 15 then more 15 else nibble
     in
     try
-      if n = 0 then raise (Bad "lz4: empty block");
-      let finished = ref false in
-      while not !finished do
-        let token = next () in
-        let lit = ext_len (token lsr 4) in
-        if !ip + lit > n then raise (Bad "lz4: literals past end of input");
-        if !op + lit > max_len then raise (Bad "lz4: output exceeds max_len");
-        Bytes.blit_string src !ip out !op lit;
-        ip := !ip + lit;
-        op := !op + lit;
-        if !ip = n then finished := true
-        else begin
-          let lo = next () in
-          let hi = next () in
-          let offset = lo lor (hi lsl 8) in
-          if offset = 0 then raise (Bad "lz4: zero offset");
-          if offset > !op then raise (Bad "lz4: offset before start of output");
-          let mlen = ext_len (token land 0x0f) + min_match in
-          if !op + mlen > max_len then raise (Bad "lz4: output exceeds max_len");
-          let from = !op - offset in
-          if offset >= mlen then Bytes.blit out from out !op mlen
-          else
-            for i = 0 to mlen - 1 do
-              Bytes.unsafe_set out (!op + i) (Bytes.unsafe_get out (from + i))
-            done;
-          op := !op + mlen
+      if n = 0 then fail "empty block";
+      let rec loop () =
+        let token = byte () in
+        let lit = length (token lsr 4) in
+        if !p + lit > n then fail "literals past end of input";
+        if !o + lit > max_len then fail "output exceeds max_len";
+        Bytes.blit_string src !p out !o lit;
+        p := !p + lit;
+        o := !o + lit;
+        if !p < n then begin
+          let lo = byte () in
+          let offset = lo lor (byte () lsl 8) in
+          if offset = 0 then fail "zero offset";
+          if offset > !o then fail "offset before start of output";
+          let len = length (token land 15) + min_match in
+          if !o + len > max_len then fail "output exceeds max_len";
+          (* Byte by byte, so an offset shorter than the length repeats. *)
+          for k = 0 to len - 1 do
+            Bytes.unsafe_set out (!o + k) (Bytes.unsafe_get out (!o - offset + k))
+          done;
+          o := !o + len;
+          loop ()
         end
-      done;
-      Ok (Bytes.sub_string out 0 !op)
-    with Bad e -> Error e
+      in
+      loop ();
+      Ok (Bytes.sub_string out 0 !o)
+    with Malformed m -> Error m
 end
 
 (* ── Files ───────────────────────────────────────────────────────────────── *)

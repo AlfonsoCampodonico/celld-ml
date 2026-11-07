@@ -99,8 +99,7 @@ type file = {
 }
 
 val encode : header -> pages:(int * string) list -> post_apply_checksum:int64 -> string
-(** Encodes a v0.5.2 file (sized raw LZ4 blocks, byte-exact with upstream's
-    pierrec/lz4 fast compressor). Raises [Invalid_argument] when the header
+(** Encodes a v0.5.2 file (pages as sized raw LZ4 blocks). Raises [Invalid_argument] when the header
     is invalid, a page is not [page_size] long, pages are not strictly
     ascending (snapshots: contiguous from 1, skipping the lock page), a page
     is the lock page or above [commit], or the post-apply checksum is
@@ -133,8 +132,9 @@ module Lz4 : sig
   (** [n + n / 255 + 16]. *)
 
   val compress : string -> string
-  (** One independent LZ4 block, a port of pierrec/lz4 v4.1.23's fast block
-      compressor (byte-identical to what upstream LTX writes). *)
+  (** One independent LZ4 block from a greedy single-probe matcher. Any
+      LZ4 decoder reads it; the bytes differ from what other encoders
+      produce for the same input. *)
 
   val decompress : string -> max_len:int -> (string, string) result
   (** Full LZ4 block decoder; errors when the output would exceed

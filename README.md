@@ -49,7 +49,7 @@ GC, WebSockets and the tunnel. A forwarded request is one signed POST.
 | path | what |
 |---|---|
 | `lib/logic` | the core: types, phases, `on_event` |
-| `lib/ltx` | the LTX format, CRC-64, and an LZ4 block codec (a port of pierrec/lz4) |
+| `lib/ltx` | the LTX format, CRC-64, and an LZ4 block codec written from the format spec |
 | `lib/cell` | the paged KV store, capture, restore planning, and the cell classes |
 | `lib/wire` | JSON records, the `CLA1` log batch, and peer signing helpers |
 | `lib/http`, `lib/http/mirage`, `lib/bucketc` | HTTP/1.1, plus server and client over mirage-tcpip, plus the bucket client |

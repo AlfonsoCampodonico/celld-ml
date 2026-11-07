@@ -6,7 +6,6 @@ let check name cond =
   if not cond then failwith ("FAIL: " ^ name);
   incr passed
 
-let hex s = String.concat "" (List.map (fun c -> Printf.sprintf "%02x" (Char.code c)) (List.of_seq (String.to_seq s)))
 
 let unhex h =
   String.init (String.length h / 2) (fun i -> Char.chr (int_of_string ("0x" ^ String.sub h (2 * i) 2)))
@@ -67,9 +66,32 @@ let () =
     done;
     ignore (roundtrip (Printf.sprintf "mixed %d" i) (Buffer.contents b))
   done;
-  (* Hand-traced through the pierrec/lz4 v4.1.23 algorithm: 32 zero bytes. *)
-  check "pierrec golden 32 zeros"
-    (hex (Lz4.compress (String.make 32 '\000')) = "18000100000200000200b0" ^ String.make 22 '0');
+  (* Encoder end-of-block rules: the last 5 bytes are literals, and no
+     match starts within the last 12 bytes. *)
+  let ends_ok s =
+    let c = Lz4.compress s and n = String.length s in
+    let p = ref 0 and o = ref 0 and ok = ref true in
+    let byte () = let b = Char.code c.[!p] in incr p; b in
+    let len nib = if nib < 15 then nib else (let l = ref 15 and go = ref true in
+      while !go do let b = byte () in l := !l + b; go := b = 255 done; !l) in
+    while !p < String.length c do
+      let t = byte () in
+      let lit = len (t lsr 4) in
+      p := !p + lit; o := !o + lit;
+      if !p < String.length c then begin
+        p := !p + 2;
+        if !o > n - 12 then ok := false;
+        o := !o + len (t land 15) + 4;
+        if !o > n - 5 then ok := false
+      end
+    done;
+    !ok
+  in
+  check "end rules zeros" (ends_ok (String.make 4096 '\000'));
+  check "end rules text" (ends_ok text);
+  for i = 0 to 20 do
+    check (Printf.sprintf "end rules random %d" i) (ends_ok (String.make (13 + i) 'q'))
+  done;
   (* Hand-made blocks with overlapping match copies. *)
   check "overlap offset 1"
     (Lz4.decompress (unhex "1661010000") ~max_len:100 = Ok (String.make 11 'a'));
