@@ -7,9 +7,10 @@ unikernel on Solo5 `hvt` (KVM).
 celld runs distributed Durable Objects with no consensus service. A *cell*
 is a named object. A conditional write in an object-store bucket makes
 exactly one node its owner, and every committed write is captured as an LTX
-file. This fork keeps that design and drops the payload: there is no V8,
-Workers runtime or SQLite. Cells are native OCaml handlers (`Counter`, `Kv`)
-over a paged in-memory KV store. See [DESIGN.md](DESIGN.md) for the mapping.
+file. This fork keeps that design. `Sql:` cells are SQLite databases
+running inside the unikernel. `Counter:` and `Kv:` cells are native OCaml
+handlers over a paged KV store. There is no V8 or Workers runtime yet. See
+[DESIGN.md](DESIGN.md) for the mapping.
 
 ## How it fits together
 
@@ -159,6 +160,14 @@ claim its cells.
   `POST /.well-known/celld/drain` stops a node from taking ownership and
   hands off every cell. Once its log is in the bucket, the node writes an
   expired lease with no open log and exits 0, so no one has to recover it.
+- **SQLite cells.** `Sql:<id>` cells run SQLite 3.54.1 (vendored
+  amalgamation) inside the unikernel. It is built without threads or an OS
+  layer and uses an in-memory VFS that records which pages each write
+  touches. Those pages become the commit's LTX file, the same pages celld
+  captures from SQLite's WAL. `POST /do/Sql:<id>/query` runs the body as SQL
+  and returns the last result set as JSON, and `GET /` lists the tables. A
+  request that leaves a transaction open is rolled back, so each commit is
+  one request.
 - **Alarms.** `PUT /do/<cell>/__alarm?in_ms=N` (or `?at_ms=T`) sets the
   cell's one alarm, and `GET` or `DELETE` read or clear it. The alarm is a
   key in the cell's own state, so it is captured, replicated and moves with
@@ -177,7 +186,8 @@ The fork leaves out queues, cron, WebSockets and the tunnel. A forwarded request
 |---|---|
 | `lib/logic` | the core: types, phases, `on_event` |
 | `lib/ltx` | the LTX format, CRC-64, and an LZ4 block codec written from the format spec |
-| `lib/cell` | the paged KV store, capture, restore planning, and the cell classes |
+| `lib/cell` | the page store (KV or SQLite), capture, restore planning, GC, and the cell classes |
+| `lib/sqlite` | the vendored SQLite amalgamation, an in-memory VFS with dirty-page tracking, and the OCaml binding |
 | `lib/wire` | JSON records, the `CLA1` log batch, and peer signing helpers |
 | `lib/http`, `lib/http/mirage`, `lib/bucketc` | HTTP/1.1, plus server and client over mirage-tcpip, plus the bucket client |
 | `unikernels/bucket` | an S3-like object store with ETag CAS, persisted to a block device |
@@ -246,6 +256,10 @@ dune build @runtest --root . --build-dir _build_all
   them 3/3/3 within one discovery round. Draining n2 then moved its 3 cells
   to n1 and n3, and n2 exited with code 0. All 9 counters kept their
   values.
+- **SQLite:** a `Sql:` cell took 40 inserts forwarded from other nodes
+  and refused a request that left a transaction open. It compacted from 18
+  files to 1 snapshot plus a few, and after its owner was killed the new
+  owner restored all 40 rows at e2.
 - **Alarms:** an alarm fired on its owner's timer, an alarm on a cell
   evicted 5 s earlier woke it at e2 and fired once, and an alarm whose
   owner was killed fired on the node that took over. The `alarms/` index

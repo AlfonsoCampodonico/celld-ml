@@ -1,0 +1,26 @@
+; SQLite (public domain, vendored as the 3.54.1 amalgamation) with an
+; in-memory VFS, built without threads or an OS layer so it also links into
+; a Solo5 unikernel.
+(library
+ (name celld_sqlite)
+ (foreign_stubs
+  (language c)
+  (names celld_sqlite3 celld_sqlite_stubs)
+  (extra_deps sqlite3.c)
+  (flags
+   (:standard
+    -O2
+    -w
+    -DNDEBUG
+    -DSQLITE_OS_OTHER=1
+    -DSQLITE_THREADSAFE=0
+    -DSQLITE_TEMP_STORE=3
+    -DSQLITE_DEFAULT_PAGE_SIZE=4096
+    -DSQLITE_DEFAULT_MEMSTATUS=0
+    -DSQLITE_DQS=0
+    -DSQLITE_OMIT_LOAD_EXTENSION
+    -DSQLITE_OMIT_LOCALTIME
+    -DSQLITE_OMIT_DEPRECATED
+    -DSQLITE_OMIT_SHARED_CACHE
+    -DSQLITE_OMIT_WAL
+    -DSQLITE_MAX_MMAP_SIZE=0))))

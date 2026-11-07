@@ -9,3 +9,6 @@ licensed under the Apache License 2.0. lib/ltx follows celld's LTX
 format and crates/ltx and was rewritten in OCaml; the protocols in
 lib/logic, lib/wire and unikernels/node follow celld's design. These are
 modified works: none of celld's source is included verbatim.
+
+lib/sqlite/sqlite3.c and sqlite3.h are the SQLite 3.54.1 amalgamation
+(https://sqlite.org), which is in the public domain.

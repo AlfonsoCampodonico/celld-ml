@@ -1,7 +1,10 @@
-(* A cell's state: an ordered KV map, serialized into fixed-size pages so that
-   every commit can be captured as an LTX file, the way celld captures SQLite
-   WAL frames. The page image is a pure function of the map, so restore only
-   has to replay pages. *)
+(* A cell's state as fixed-size pages, so every commit can be captured as an
+   LTX file, the way celld captures SQLite WAL frames. Two backings:
+   - an ordered KV map, whose page image is a pure function of the map;
+   - a SQLite database, whose pages are SQLite's own (Sql: cells).
+   Restore replays pages either way. *)
+
+module Sql = Celld_sqlite
 
 module M = Map.Make (String)
 
@@ -13,9 +16,11 @@ type t = {
   mutable txid : int64;  (** last committed transaction *)
   mutable pages : string array;  (** page [i] is pgno [i+1] *)
   mutable checksum : int64;  (** rolling database checksum of [pages] *)
+  mutable sql : Sql.db option;  (** the database, for Sql: cells; [kv] is unused then *)
 }
 
-let empty () = { kv = M.empty; txid = 0L; pages = [||]; checksum = Celld_ltx.db_checksum [] }
+let empty ?(sql = false) () =
+  { kv = M.empty; txid = 0L; pages = [||]; checksum = Celld_ltx.db_checksum []; sql = (if sql then Some (Sql.open_image "") else None) }
 
 let be32 n =
   let b = Bytes.create 4 in
@@ -68,8 +73,27 @@ let snapshot t =
 
 (* Commit the current [kv]: returns the new txid and its LTX file. The first
    transaction of a database is necessarily a snapshot. *)
+(* The page image a commit would produce now. *)
+let next_pages t =
+  match t.sql with
+  | None -> paginate (serialize t.kv)
+  | Some db ->
+      let n, dirty = Sql.dirty db in
+      let pages = Array.init n (fun i -> if i < Array.length t.pages then t.pages.(i) else String.make page_size '\000') in
+      List.iter (fun (pgno, data) -> if pgno <= n then pages.(pgno - 1) <- data) dirty;
+      pages
+
+(* Whether a commit now would change any page. *)
+let changed t =
+  match t.sql with
+  | None -> next_pages t <> t.pages
+  | Some db ->
+      let n, dirty = Sql.dirty db in
+      n <> Array.length t.pages || List.exists (fun (pgno, data) -> pgno > Array.length t.pages || t.pages.(pgno - 1) <> data) dirty
+
 let commit t =
-  let pages = paginate (serialize t.kv) in
+  let pages = next_pages t in
+  Option.iter Sql.clear_dirty t.sql;
   let txid = Int64.succ t.txid in
   let changed = ref [] and removed = ref [] in
   Array.iteri
@@ -98,7 +122,7 @@ let commit t =
 
 (* Apply a restore chain: a snapshot followed by contiguous incrementals. A
    file that does not continue the chain ends it. *)
-let restore files =
+let restore ?(sql = false) files =
   let t = empty () in
   let apply (f : Celld_ltx.file) =
     let h = f.header in
@@ -117,8 +141,48 @@ let restore files =
   in
   let rec go = function [] -> () | f :: rest -> if apply f then go rest in
   go files;
-  if t.txid = 0L then Ok t
+  if sql then
+    match Sql.open_image (String.concat "" (Array.to_list t.pages)) with
+    | db -> t.sql <- Some db; Ok t
+    | exception Failure e -> Error e
+  else if t.txid = 0L then Ok t
   else match deserialize t.pages with Ok kv -> t.kv <- kv; Ok t | Error e -> Error e
+
+(* ---- runtime metadata (the alarm) ----
+   KV cells keep it under NUL-prefixed keys; Sql: cells in a table, so it is
+   part of the same pages and commits either way. *)
+
+let meta_table = "__celld_meta"
+
+let sql_quote s =
+  let b = Buffer.create (String.length s + 2) in
+  Buffer.add_char b '\'';
+  String.iter (fun c -> if c = '\'' then Buffer.add_string b "''" else Buffer.add_char b c) s;
+  Buffer.add_char b '\'';
+  Buffer.contents b
+
+let meta_get t k =
+  match t.sql with
+  | None -> M.find_opt ("\000" ^ k) t.kv
+  | Some db -> (
+      (* No table yet is an error, which reads as no value. *)
+      match Sql.exec db (Printf.sprintf "SELECT v FROM %s WHERE k = %s" meta_table (sql_quote k)) with
+      | Ok { rows = [ [ v ] ]; _ } -> v
+      | _ -> None)
+
+let meta_set t k v =
+  match t.sql with
+  | None -> t.kv <- M.add ("\000" ^ k) v t.kv
+  | Some db ->
+      ignore
+        (Sql.exec db
+           (Printf.sprintf "CREATE TABLE IF NOT EXISTS %s(k TEXT PRIMARY KEY, v TEXT); INSERT OR REPLACE INTO %s VALUES (%s, %s)" meta_table meta_table
+              (sql_quote k) (sql_quote v)))
+
+let meta_remove t k =
+  match t.sql with
+  | None -> t.kv <- M.remove ("\000" ^ k) t.kv
+  | Some db -> if meta_get t k <> None then ignore (Sql.exec db (Printf.sprintf "DELETE FROM %s WHERE k = %s" meta_table (sql_quote k)))
 
 (* Choose the restore chain from the keys under cells/<cell>/ltx/: the newest
    epoch that opens with a snapshot, then that epoch's files that continue it.

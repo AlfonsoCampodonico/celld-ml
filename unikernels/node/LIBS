@@ -1,5 +1,6 @@
 celld_logic
 celld_ltx
+celld_sqlite
 celld_cell
 celld_wire
 celld_http

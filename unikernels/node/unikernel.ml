@@ -449,7 +449,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         >>= fun files ->
         match List.partition Result.is_ok files with
         | ok, [] -> (
-            match Store.restore (List.map Result.get_ok ok) with
+            match Store.restore ~sql:(Handlers.is_sql cell) (List.map Result.get_ok ok) with
             | Error e -> Lwt.return (Error e)
             | Ok store ->
                 Hashtbl.replace t.runtimes cell { store; epoch; snap_txid = Int64.to_int store.txid };
@@ -670,7 +670,9 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
     | Some rt, Some handler when rt.epoch = epoch ->
         (* Handler and commit run without yielding: the cell is serial. *)
         let alarm_before = Handlers.alarm_of rt.store in
-        let reply = handler rt.store ~now_ms:(now_ms ()) ~meth ~path ~query ~body in
+        let now = now_ms () in
+        Celld_sqlite.set_now (Int64.of_int now);
+        let reply = handler rt.store ~now_ms:now ~meth ~path ~query ~body in
         let position =
           if reply.wrote then begin
             let txid, ltx = Store.commit rt.store in
@@ -759,7 +761,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
     | _ when fst (Celld_http.path_and_query r.target) = "/state" -> Lwt.return { Celld_http.status = 200; headers = [ ("content-type", "application/json") ]; body = state_json t }
     | Some (cell, path, query) when Handlers.valid_cell cell && Handlers.dispatch cell <> None ->
         serve_cell t cell ~meth:r.meth ~path ~query ~body:r.body
-    | Some _ -> Lwt.return (text 404 "unknown cell class (Counter:<id> or Kv:<id>)\n")
+    | Some _ -> Lwt.return (text 404 "unknown cell class (Counter:<id>, Kv:<id> or Sql:<id>)\n")
     | None -> Lwt.return (text 404 "try /do/Counter:<id>/increment or /do/Kv:<id>/<key>\n")
 
   let internal t (r : Celld_http.request) =

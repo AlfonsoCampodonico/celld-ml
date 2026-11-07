@@ -34,10 +34,11 @@ What carries over from celld:
 - **Signed peer HTTP.** HMAC-SHA256 with a fleet secret created once in
   `fleet/peer-auth.json`.
 
-What does not carry over: V8, Workers, and SQLite. Cells run native OCaml
-handlers (`Counter`, `Kv`) over an in-memory KV that is paged into 4 KiB pages
-for LTX. Starting and Publishing are folded into Restoring. There is no
-rebalance, drain, alarms, queues, or cron.
+What does not carry over: V8 and the Workers runtime. `Sql:` cells run
+SQLite inside the unikernel, with an in-memory VFS whose dirty pages become
+each commit's LTX file. `Counter:` and `Kv:` cells run native OCaml handlers
+over a KV map paged into 4 KiB pages. Starting and Publishing are folded into
+Restoring. There are no queues or cron.
 
 ## Layout
 

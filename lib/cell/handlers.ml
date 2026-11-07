@@ -53,8 +53,7 @@ let kv (s : Store.t) ~meth ~path ~query:_ ~body =
    class's alarm handler, and is a no-op when nothing is due, so a duplicate
    fire from a stale timer or a second node is harmless. *)
 
-let alarm_key = "\000alarm"
-let alarm_of (s : Store.t) = Option.bind (M.find_opt alarm_key s.kv) int_of_string_opt
+let alarm_of (s : Store.t) = Option.bind (Store.meta_get s "alarm") int_of_string_opt
 
 let bump k (s : Store.t) = s.kv <- M.add k (string_of_int (int_of k s.kv + 1)) s.kv
 
@@ -78,23 +77,74 @@ let with_alarm on_alarm h : handler =
       in
       match at with
       | Some at ->
-          s.kv <- M.add alarm_key (string_of_int at) s.kv;
+          Store.meta_set s "alarm" (string_of_int at);
           ok ~wrote:true (string_of_int at ^ "\n")
       | None -> err 400 "PUT /__alarm?in_ms=N or ?at_ms=T\n")
   | "DELETE", "/__alarm" ->
       if alarm_of s = None then ok "none\n"
       else begin
-        s.kv <- M.remove alarm_key s.kv;
+        Store.meta_remove s "alarm";
         ok ~wrote:true "cleared\n"
       end
   | "ALARM", "/__alarm/fire" -> (
       match alarm_of s with
       | Some at when at <= now_ms ->
-          s.kv <- M.remove alarm_key s.kv;
+          Store.meta_remove s "alarm";
           on_alarm s;
           ok ~wrote:true "fired\n"
       | _ -> ok "not due\n")
   | _ -> h s ~meth ~path ~query ~body
+
+(* ---- Sql: a SQLite database per cell ----
+   POST /query runs the body as SQL and answers the last result set as
+   JSON. GET / lists the tables. A request must leave no transaction open:
+   one that does is rolled back, so every commit is one request. *)
+
+let json_str s =
+  let b = Buffer.create (String.length s + 2) in
+  Buffer.add_char b '"';
+  String.iter
+    (function
+      | '"' -> Buffer.add_string b "\\\""
+      | '\\' -> Buffer.add_string b "\\\\"
+      | '\n' -> Buffer.add_string b "\\n"
+      | c when Char.code c < 0x20 -> Buffer.add_string b (Printf.sprintf "\\u%04x" (Char.code c))
+      | c -> Buffer.add_char b c)
+    s;
+  Buffer.add_char b '"';
+  Buffer.contents b
+
+let json_result (r : Celld_sqlite.result_set) =
+  let row cells = "[" ^ String.concat "," (List.map (function None -> "null" | Some v -> json_str v) cells) ^ "]" in
+  Printf.sprintf "{\"columns\":%s,\"rows\":[%s]}\n" (row (List.map Option.some r.columns)) (String.concat "," (List.map row r.rows))
+
+let sql (s : Store.t) ~meth ~path ~query:_ ~body =
+  match s.sql with
+  | None -> err 500 "not a SQL cell\n"
+  | Some db -> (
+      let run q =
+        let r = Celld_sqlite.exec db q in
+        if not (Celld_sqlite.autocommit db) then begin
+          ignore (Celld_sqlite.exec db "ROLLBACK");
+          err 400 "transaction left open; rolled back\n"
+        end
+        else
+          match r with
+          | Error e -> err 400 (e ^ "\n")
+          | Ok rs -> { status = 200; body = json_result rs; wrote = Store.changed s }
+      in
+      match meth, path with
+      | "POST", "/query" -> run body
+      | "GET", ("" | "/") ->
+          run (Printf.sprintf "SELECT name FROM sqlite_master WHERE type = 'table' AND name <> '%s' ORDER BY name" Store.meta_table)
+      | _ -> err 404 "sql: GET /, POST /query\n")
+
+let sql_alarm (s : Store.t) =
+  Option.iter
+    (fun db -> ignore (Celld_sqlite.exec db "CREATE TABLE IF NOT EXISTS alarms_fired(at INTEGER); INSERT INTO alarms_fired VALUES (unixepoch('subsec') * 1000)"))
+    s.sql
+
+let is_sql cell = String.length cell > 4 && String.sub cell 0 4 = "Sql:"
 
 let class_of cell = match String.index_opt cell ':' with Some i -> String.sub cell 0 i | None -> "Counter"
 
@@ -107,4 +157,5 @@ let dispatch cell : handler option =
   match class_of cell with
   | "Counter" -> Some (with_alarm counter_alarm counter)
   | "Kv" -> Some (with_alarm kv_alarm kv)
+  | "Sql" -> Some (with_alarm sql_alarm sql)
   | _ -> None

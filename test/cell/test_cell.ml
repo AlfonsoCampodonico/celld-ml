@@ -116,3 +116,35 @@ let () =
   check "kv hides the reserved key"
     ((kvh k ~now_ms:0 ~meth:"GET" ~path:"/" ~query:[] ~body:"").body = ""
     && (kvh k ~now_ms:0 ~meth:"GET" ~path:"/\000alarm" ~query:[] ~body:"").status = 400)
+
+(* Sql: cells: commits are SQLite pages, restore reopens the database. *)
+let () =
+  let h = Option.get (Handlers.dispatch "Sql:t") in
+  let s = Store.empty ~sql:true () in
+  let q body = h s ~now_ms:1000 ~meth:"POST" ~path:"/query" ~query:[] ~body in
+  let files = ref [] in
+  let commit () = let _, f = Store.commit s in files := !files @ [ Result.get_ok (Celld_ltx.decode f) ] in
+  let r = q "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)" in
+  check "sql create writes" (r.status = 200 && r.wrote);
+  commit ();
+  let r = q "INSERT INTO notes(body) VALUES ('hello'), ('wor\"ld')" in
+  check "sql insert writes" r.wrote;
+  commit ();
+  let r = q "SELECT id, body FROM notes ORDER BY id" in
+  check "sql select is read-only JSON"
+    ((not r.wrote) && r.body = "{\"columns\":[\"id\",\"body\"],\"rows\":[[\"1\",\"hello\"],[\"2\",\"wor\\\"ld\"]]}\n");
+  check "first sql commit is a snapshot" (Celld_ltx.is_snapshot (List.hd !files).header);
+  let r = q "BEGIN; INSERT INTO notes(body) VALUES ('x')" in
+  check "open transaction is rolled back" (r.status = 400 && not (Store.changed s));
+  let r = h s ~now_ms:1000 ~meth:"PUT" ~path:"/__alarm" ~query:[ ("in_ms", "5") ] ~body:"" in
+  check "sql alarm set" (r.wrote && Handlers.alarm_of s = Some 1005);
+  commit ();
+  (match Store.restore ~sql:true !files with
+  | Ok r ->
+      let h2 = Option.get (Handlers.dispatch "Sql:t") in
+      let res = h2 r ~now_ms:2000 ~meth:"POST" ~path:"/query" ~query:[] ~body:"SELECT count(*) FROM notes" in
+      check "sql restore from LTX" (res.body = "{\"columns\":[\"count(*)\"],\"rows\":[[\"2\"]]}\n");
+      check "sql alarm restored" (Handlers.alarm_of r = Some 1005);
+      let f = h2 r ~now_ms:2000 ~meth:"ALARM" ~path:"/__alarm/fire" ~query:[] ~body:"" in
+      check "sql alarm fires" (f.wrote && Handlers.alarm_of r = None)
+  | Error e -> check ("sql restore: " ^ e) false)
