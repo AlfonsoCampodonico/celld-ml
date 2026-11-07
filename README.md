@@ -132,6 +132,11 @@ claim its cells.
   pages, CRC-64/GO-ISO and rolling checksums. Files land under
   `cells/<cell>/ltx/e<epoch>/...`. Each epoch opens with a snapshot, and the
   epoch prefix is the fence.
+- **Compaction and epoch GC.** Every `--compact-every` commits (default
+  64) the owner uploads a level-1 snapshot and deletes the files it
+  covers. When a cell is stopped, files from older epochs are deleted.
+  Restore reads the newest snapshot of the newest epoch plus what follows
+  it.
 - **The output gate.** A response that reveals a write is held until the
   write is proven. Reads trail the newest open barrier on their cell.
 - **Fleet vs bucket proofs.**
@@ -148,8 +153,8 @@ claim its cells.
 - **Signed peer HTTP.** Requests are HMAC-SHA256-signed with a fleet secret
   that is created once with a conditional write.
 
-The fork leaves out alarms, queues, cron, rebalance, drain, compaction, epoch
-GC, WebSockets and the tunnel. A forwarded request is one signed POST.
+The fork leaves out alarms, queues, cron, rebalance, drain, WebSockets and
+the tunnel. A forwarded request is one signed POST.
 
 ## Layout
 
@@ -219,6 +224,9 @@ dune build @runtest --root . --build-dir _build_all
   (`holding 10 entries`), and n2 recovered n1's log and restored 10. With
   a 256 KB log disk and 400 writes, each follower compacted twice and all
   400 came back.
+- **Compaction:** 150 writes left one level-1 snapshot plus 22 files
+  instead of 150. After a takeover the new owner restored 150 from them,
+  and after it went idle the cell was down to a single file.
 - **Partition:** a node cut off from the bucket logged
   `SELF-FENCE: node lease expired` and exited with code 3, and another node
   took over its cell at the next epoch with its state intact.

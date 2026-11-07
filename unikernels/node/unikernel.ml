@@ -27,6 +27,7 @@ let ttl_ms = arg "ttl-ms" "Node lease lifetime." Cmdliner.Arg.int 10_000
 let idle_ms = arg "idle-ms" "Evict a cell idle this long." Cmdliner.Arg.int 30_000
 let durability = arg "durability" "fleet or bucket." Cmdliner.Arg.string "fleet"
 let max_followers = arg "followers" "Followers to recruit in fleet mode." Cmdliner.Arg.int 2
+let compact_every = arg "compact-every" "Upload a level-1 snapshot every this many commits, then delete what it covers." Cmdliner.Arg.int 64
 let upload_delay_ms = arg "upload-delay-ms" "Delay before each LTX upload (to show the fleet path)." Cmdliner.Arg.int 0
 
 let public_port = 8080
@@ -72,7 +73,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
   (* What this node holds for other leaders, keyed by leader session. *)
   type held = { mutable sealed : bool; entries : (int, Wire.entry) Hashtbl.t }
 
-  type runtime = { store : Store.t; epoch : int }
+  type runtime = { store : Store.t; epoch : int; mutable snap_txid : int  (** last snapshot the bucket has *) }
 
   type t = {
     stack : S.t;
@@ -372,9 +373,29 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
             | Ok `Precondition_failed -> Error (Definite "lost the recovery claim")
             | Error f -> Error (fail_of f)
 
+  (* ---- compaction and epoch GC ----
+     Derived data, so none of it goes through the node log or the output
+     gate: a lost snapshot or a failed delete only leaves more files. *)
+
+  let gc t cell ~epoch ~upto =
+    B.list t.bucket ~prefix:(Wire.ltx_prefix cell) >>= function
+    | Error _ -> Lwt.return_unit
+    | Ok keys ->
+        let plen = String.length (Wire.ltx_prefix cell) in
+        let rel = List.map (fun k -> String.sub k plen (String.length k - plen)) keys in
+        let dead = Store.garbage rel ~epoch ~upto in
+        Lwt_list.iter_s (fun k -> B.delete t.bucket (Wire.ltx_prefix cell ^ k) >|= ignore) dead >|= fun () ->
+        if dead <> [] then Log.info (fun m -> m "gc %s e%d: deleted %d of %d files" cell epoch (List.length dead) (List.length keys))
+
+  let compact t cell epoch txid snapshot =
+    let key = Wire.ltx_prefix cell ^ Celld_ltx.key ~epoch ~level:1 ~min_txid:1L ~max_txid:(Int64.of_int txid) in
+    B.put t.bucket key snapshot >>= function
+    | Ok (`Ok _) -> gc t cell ~epoch ~upto:txid
+    | _ -> Log.warn (fun m -> m "compaction of %s at txid %d failed" cell txid); Lwt.return_unit
+
   (* ---- restore ---- *)
 
-  let restore t cell epoch =
+  let rec restore ?(retried = false) t cell epoch =
     B.list t.bucket ~prefix:(Wire.ltx_prefix cell) >>= function
     | Error f -> Lwt.return (Error (string_of_failure (fail_of f)))
     | Ok keys -> (
@@ -387,19 +408,21 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
             | Ok (Some (body, _)) -> Celld_ltx.decode body
             | _ -> Error ("cannot read " ^ k))
           chain
-        >|= fun files ->
+        >>= fun files ->
         match List.partition Result.is_ok files with
         | ok, [] -> (
             match Store.restore (List.map Result.get_ok ok) with
-            | Error e -> Error e
+            | Error e -> Lwt.return (Error e)
             | Ok store ->
-                Hashtbl.replace t.runtimes cell { store; epoch };
+                Hashtbl.replace t.runtimes cell { store; epoch; snap_txid = Int64.to_int store.txid };
                 (* Each epoch opens with a snapshot of what it restored. *)
                 if store.txid > 0L then capture t cell epoch store.txid (Store.snapshot store);
                 Log.info (fun m -> m "restored %s at e%d (txid %Ld, %d files)" cell epoch store.txid (List.length ok));
-                Ok ())
-        | _, Error e :: _ -> Error e
-        | _ -> Error "unreachable")
+                Lwt.return (Ok ()))
+        (* A previous owner's GC can delete a file between our list and get. *)
+        | _, Error _ :: _ when not retried -> restore ~retried:true t cell epoch
+        | _, Error e :: _ -> Lwt.return (Error e)
+        | _ -> Lwt.return (Error "unreachable"))
 
   (* ---- effect executor ---- *)
 
@@ -502,6 +525,9 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
     | Stop_runtime { op; cell; epoch; reset } ->
         Log.info (fun m -> m "stopping %s at e%d%s" cell epoch (if reset then " (reset)" else ""));
         Hashtbl.remove t.runtimes cell;
+        (* Ensure_durable ran first, so this epoch's files are all in the
+           bucket and older epochs are dead weight. *)
+        if not reset then Lwt.async (fun () -> gc t cell ~epoch ~upto:0);
         push t (Runtime_stopped { op; cell })
     | Release_owner { op; cell; guard; epoch } ->
         async_bucket t (fun () ->
@@ -538,7 +564,13 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
           if reply.wrote then begin
             let txid, ltx = Store.commit rt.store in
             capture t cell epoch txid ltx;
-            Some (Int64.to_int txid)
+            let txid = Int64.to_int txid in
+            if compact_every () > 0 && txid - rt.snap_txid >= compact_every () then begin
+              rt.snap_txid <- txid;
+              let snapshot = Store.snapshot rt.store in
+              Lwt.async (fun () -> compact t cell epoch txid snapshot)
+            end;
+            Some txid
           end
           else None
         in

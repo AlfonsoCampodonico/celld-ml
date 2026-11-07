@@ -54,3 +54,40 @@ let () =
   let r = Handlers.kv s2 ~meth:"PUT" ~path:"/a" ~query:[] ~body:"1" in
   check "kv handler writes" (r.wrote && (Handlers.kv s2 ~meth:"GET" ~path:"/a" ~query:[] ~body:"").body = "1");
   check "cell ids validated" (Handlers.valid_cell "Counter:x" && not (Handlers.valid_cell "a/b") && not (Handlers.valid_cell ".."))
+
+(* Compaction + GC: a level-1 snapshot lets the files it covers and every
+   older epoch go, and restore still lands on the same state. *)
+let () =
+  let bucket = Hashtbl.create 16 in
+  let put ?(level = 0) epoch file =
+    match Celld_ltx.decode file with
+    | Ok f -> Hashtbl.replace bucket (Celld_ltx.key ~epoch ~level ~min_txid:f.header.min_txid ~max_txid:f.header.max_txid) file
+    | Error e -> failwith e
+  in
+  let keys () = Hashtbl.fold (fun k _ acc -> k :: acc) bucket [] in
+  let load () =
+    Store.restore (List.map (fun k -> match Celld_ltx.decode (Hashtbl.find bucket k) with Ok f -> f | Error e -> failwith e) (Store.plan (keys ())))
+  in
+  let s = Store.empty () in
+  let bump epoch =
+    ignore (Handlers.counter s ~meth:"POST" ~path:"/increment" ~query:[] ~body:"");
+    let _, f = Store.commit s in
+    put epoch f
+  in
+  for _ = 1 to 3 do bump 1 done;
+  (* epoch 2 opens with a snapshot of txid 3, then 5 more writes *)
+  put 2 (Store.snapshot s);
+  for _ = 1 to 5 do bump 2 done;
+  put ~level:1 2 (Store.snapshot s);
+  bump 2;
+  let before = List.length (keys ()) in
+  let dead = Store.garbage (keys ()) ~epoch:2 ~upto:8 in
+  List.iter (Hashtbl.remove bucket) dead;
+  check "gc drops older epoch and covered files" (List.length dead = 9 && before - List.length (keys ()) = 9);
+  check "gc keeps the snapshot and what follows" (List.length (keys ()) = 2);
+  (match load () with
+  | Ok r -> check "restore after gc" (r.txid = 9L && Store.M.find "value" r.kv = "9")
+  | Error e -> check ("restore after gc: " ^ e) false);
+  check "upto 0 only drops older epochs"
+    (Store.garbage [ "e0000000000000001/0000/0000000000000001-0000000000000001.ltx"; "e0000000000000002/0000/0000000000000002-0000000000000002.ltx" ] ~epoch:2 ~upto:0
+     = [ "e0000000000000001/0000/0000000000000001-0000000000000001.ltx" ])

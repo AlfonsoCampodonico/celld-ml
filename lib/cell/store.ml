@@ -143,3 +143,19 @@ let plan keys =
             snap_key :: chain top [])
   in
   pick epochs
+
+(* Keys under cells/<cell>/ltx/ that a resident owner at [epoch] may delete
+   once a snapshot at txid [upto] of that epoch is in the bucket ([upto] = 0
+   when only the epoch's opening snapshot is known to be there):
+   - every file of an older epoch, since restore never reads past the newest
+     epoch that has a snapshot;
+   - files of this epoch that end at or below [upto], except the snapshot
+     ending exactly at [upto] that the next restore starts from. *)
+let garbage keys ~epoch ~upto =
+  List.filter
+    (fun k ->
+      match Celld_ltx.parse_key k with
+      | None -> false
+      | Some (e, _, mn, mx) ->
+          e < epoch || (e = epoch && upto > 0 && Int64.compare mx (Int64.of_int upto) <= 0 && not (mn = 1L && mx = Int64.of_int upto)))
+    keys
