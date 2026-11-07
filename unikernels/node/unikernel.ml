@@ -105,6 +105,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
     mutable peers : lease list;  (** live, non-draining leases of other nodes, from the last discovery *)
     mutable last_shed_ms : int;
     alarm_timers : (cell_id, int) Hashtbl.t;  (** the alarm each resident cell's timer waits for *)
+    pumping : (cell_id, unit) Hashtbl.t;  (** cells whose outbox is being delivered *)
     held : (string, held) Hashtbl.t;
     disk : D.t;  (** follower log: what [held] is rebuilt from after a restart *)
     disk_lock : Lwt_mutex.t;
@@ -677,8 +678,63 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
 
   let rec fire t cell =
     serve_cell t ~forwarded:true cell ~meth:"ALARM" ~path:"/__alarm/fire" ~query:[] ~body:"" >|= fun (r : Celld_http.response) ->
-    if r.status = 200 && r.body = "fired\n" then Log.info (fun m -> m "alarm fired for %s" cell);
+    if r.status = 200 && r.body = "fired\n" then begin
+      Log.info (fun m -> m "alarm fired for %s" cell);
+      (* A queue's alarm means a batch may be due. *)
+      if Handlers.class_of cell = "Queue" then Lwt.async (fun () -> pump_queue t cell 20)
+    end;
     r
+
+  (* Lease a batch from a local queue cell, run the consumer class's queue()
+     on it in <Consumer>:__consumer (wherever that cell lives), and settle
+     the outcome. A crash anywhere in between leaves the lease to expire, so
+     the batch is redelivered. *)
+  and pump_queue t cell n =
+    if n = 0 then Lwt.return_unit
+    else
+      serve_cell t ~forwarded:true cell ~meth:"POST" ~path:"/__queue/lease" ~query:[] ~body:"" >>= fun (r : Celld_http.response) ->
+      match if r.status = 200 then Wire.of_string r.body else Error "lease failed" with
+      | Ok j -> (
+          match Wire.field "messages" j with
+          | Some (Wire.Arr (_ :: _ as msgs)) ->
+              let consumer = Wire.str_field "consumer" j and batch = Wire.str_field "batch" j in
+              serve_cell t (consumer ^ ":__consumer") ~meth:"QUEUE" ~path:"/__queue/deliver" ~query:[] ~body:r.body
+              >>= fun (d : Celld_http.response) ->
+              let ack, retry, failed =
+                match if d.status = 200 then Wire.of_string d.body else Error "" with
+                | Ok dj -> (Option.value (Wire.field "ack" dj) ~default:(Wire.Arr []), Option.value (Wire.field "retry" dj) ~default:(Wire.Arr []), false)
+                | Error _ -> (Wire.Arr [], Wire.Arr [], true)
+              in
+              if failed then Log.warn (fun m -> m "%s: consumer %s failed a batch of %d: %s" cell consumer (List.length msgs) (String.trim d.body))
+              else Log.info (fun m -> m "%s: delivered a batch of %d to %s" cell (List.length msgs) consumer);
+              let settle = Wire.to_string (Wire.Obj [ ("batch", Wire.Str batch); ("ack", ack); ("retry", retry); ("failed", Wire.Bool failed) ]) in
+              serve_cell t ~forwarded:true cell ~meth:"POST" ~path:"/__queue/settle" ~query:[] ~body:settle >>= fun _ -> pump_queue t cell (n - 1)
+          | _ -> Lwt.return_unit)
+      | Error _ -> Lwt.return_unit
+
+  (* Deliver a cell's outbox to the queues it names, then acknowledge it in
+     the cell. Runs after a durable write, and from the periodic loop. *)
+  and pump_outbox t cell =
+    match Hashtbl.find_opt t.runtimes cell with
+    | Some rt when not (Hashtbl.mem t.pumping cell) ->
+        let pending = Handlers.outbox_pending rt.store in
+        if pending = [] then Lwt.return_unit
+        else begin
+          Hashtbl.replace t.pumping cell ();
+          Lwt.finalize
+            (fun () ->
+              Lwt_list.iter_s
+                (fun (q, payloads, ids) ->
+                  let qcell = "Queue:" ^ q in
+                  if not (Handlers.valid_cell qcell) then Lwt.return_unit
+                  else
+                    serve_cell t qcell ~meth:"POST" ~path:"/__queue/send" ~query:[] ~body:payloads >>= fun (r : Celld_http.response) ->
+                    if r.status = 200 then serve_cell t ~forwarded:true cell ~meth:"OUTBOX" ~path:"/__outbox/ack" ~query:[] ~body:ids >|= ignore
+                    else (Log.warn (fun m -> m "%s: outbox to %s not delivered (%d); retrying later" cell qcell r.status); Lwt.return_unit))
+                pending)
+            (fun () -> Hashtbl.remove t.pumping cell; Lwt.return_unit)
+        end
+    | _ -> Lwt.return_unit
 
   and schedule_alarm t cell at =
     Hashtbl.replace t.alarm_timers cell at;
@@ -761,6 +817,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         (* The output gate: nothing leaves until the core releases it. *)
         p >|= (function
         | Ok () ->
+            (* the write is durable: its outbox may go out *)
+            if reply.wrote && rt.store.sql <> None then Lwt.async (fun () -> pump_outbox t cell);
             {
               Celld_http.status = reply.status;
               headers = [ ("content-type", reply.content_type); ("x-celld-node", t.me); ("x-celld-epoch", string_of_int epoch) ];
@@ -829,6 +887,46 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         Log.info (fun m -> m "draining to [%s]" (String.concat "," (List.map (fun p -> p.p_node) targets)));
         push t (Drain targets);
         Lwt.return (text 202 "draining\n")
+    | _ when String.length (fst (Celld_http.path_and_query r.target)) > 26
+             && String.sub (fst (Celld_http.path_and_query r.target)) 0 26 = "/.well-known/celld/queues/" -> (
+        let path = fst (Celld_http.path_and_query r.target) in
+        let name = String.sub path 26 (String.length path - 26) in
+        let qcell = "Queue:" ^ name in
+        if not (Handlers.valid_cell qcell) || String.contains name ':' then Lwt.return (text 400 "bad queue name\n")
+        else
+          match r.meth with
+          | "PUT" -> (
+              (* Validate the consumer settings against celld's bounds. *)
+              match Wire.of_string r.body with
+              | Error e -> Lwt.return (text 400 ("bad JSON: " ^ e ^ "\n"))
+              | Ok j ->
+                  let int k = Wire.int_field k j and has k = Wire.field k j <> None in
+                  let bad =
+                    if not (Handlers.valid_class (Wire.str_field "consumer" j)) then Some "consumer must name a JS class"
+                    else if has "max_batch_size" && (int "max_batch_size" < 1 || int "max_batch_size" > 100) then Some "max_batch_size is 1-100"
+                    else if has "max_batch_timeout_ms" && (int "max_batch_timeout_ms" < 0 || int "max_batch_timeout_ms" > 60_000) then Some "max_batch_timeout_ms is 0-60000"
+                    else if has "max_retries" && (int "max_retries" < 0 || int "max_retries" > 100) then Some "max_retries is 0-100"
+                    else if has "retry_delay_ms" && (int "retry_delay_ms" < 0 || int "retry_delay_ms" > 86_400_000) then Some "retry_delay_ms is 0-86400000"
+                    else if has "dead_letter_queue" && not (Handlers.valid_cell ("Queue:" ^ Wire.str_field "dead_letter_queue" j)) then Some "bad dead_letter_queue"
+                    else None
+                  in
+                  match bad with
+                  | Some e -> Lwt.return (text 400 (e ^ "\n"))
+                  | None -> serve_cell t qcell ~meth:"POST" ~path:"/__queue/config" ~query:[] ~body:r.body)
+          | "GET" -> serve_cell t qcell ~meth:"GET" ~path:"/" ~query:[] ~body:""
+          | _ -> Lwt.return (text 405 "PUT or GET\n"))
+    | _ when String.length (fst (Celld_http.path_and_query r.target)) > 33
+             && String.ends_with ~suffix:"/crons" (fst (Celld_http.path_and_query r.target))
+             && String.sub (fst (Celld_http.path_and_query r.target)) 0 27 = "/.well-known/celld/classes/" -> (
+        let path = fst (Celld_http.path_and_query r.target) in
+        let cls = String.sub path 27 (String.length path - 27 - 6) in
+        if not (Handlers.valid_class cls) || Handlers.dispatch (cls ^ ":x") <> None then Lwt.return (text 400 "bad class name\n")
+        else if r.meth <> "PUT" then Lwt.return (text 405 "PUT a newline-separated list of cron expressions\n")
+        else
+          let exprs = List.filter (fun e -> e <> "") (List.map String.trim (String.split_on_char '\n' r.body)) in
+          match List.find_map (fun e -> match Celld_cron.parse e with Error m -> Some (e ^ ": " ^ m) | Ok _ -> None) exprs with
+          | Some e -> Lwt.return (text 400 ("bad cron expression " ^ e ^ "\n"))
+          | None -> serve_cell t (cls ^ ":__cron") ~meth:"CRON" ~path:"/__cron/arm" ~query:[] ~body:(String.concat "\n" exprs))
     | _ when String.length (fst (Celld_http.path_and_query r.target)) > 27
              && String.sub (fst (Celld_http.path_and_query r.target)) 0 27 = "/.well-known/celld/classes/" -> (
         let path = fst (Celld_http.path_and_query r.target) in
@@ -845,6 +943,11 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
           | "GET" -> (B.get t.bucket (class_key cls) >|= function Ok (Some (s, _)) -> { Celld_http.status = 200; headers = [ ("content-type", "text/javascript") ]; body = s } | _ -> text 404 "no such class\n")
           | _ -> Lwt.return (text 405 "PUT or GET\n"))
     | _ when fst (Celld_http.path_and_query r.target) = "/state" -> Lwt.return { Celld_http.status = 200; headers = [ ("content-type", "application/json") ]; body = state_json t }
+    (* Runtime paths and methods are for the node itself, never clients. *)
+    | Some (_, path, _)
+      when (String.length path > 2 && String.sub path 0 3 = "/__" && path <> "/__alarm")
+           || not (List.mem r.meth [ "GET"; "HEAD"; "POST"; "PUT"; "PATCH"; "DELETE"; "OPTIONS" ]) ->
+        Lwt.return (text 403 "reserved for the runtime\n")
     | Some (cell, path, query) when Handlers.valid_cell cell && (Handlers.dispatch cell <> None || Handlers.is_js cell) ->
         serve_cell t cell ~meth:r.meth ~path ~query ~body:r.body
     | Some _ -> Lwt.return (text 404 "unknown cell class (Counter:<id>, Kv:<id> or Sql:<id>)\n")
@@ -1028,6 +1131,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         peers = [];
         last_shed_ms = 0;
         alarm_timers = Hashtbl.create 16;
+        pumping = Hashtbl.create 16;
         held = Hashtbl.create 4;
         disk;
         disk_lock = Lwt_mutex.create ();
@@ -1063,6 +1167,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
           if t.fleet then recruit t;
           rebalance_once t;
           scan_alarms t >>= fun () ->
+          Hashtbl.iter (fun cell rt -> if rt.store.sql <> None then Lwt.async (fun () -> pump_outbox t cell)) t.runtimes;
           sleep_ms 2_000 >>= loop
         in
         sleep_ms 500 >>= loop);

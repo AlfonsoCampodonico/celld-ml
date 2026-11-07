@@ -36,10 +36,35 @@ globalThis.Response = class Response {
     return new Response(JSON.stringify(value), { status: init.status, headers });
   }
 };
+const __celld_outbox = (queue, messages) => {
+  if (typeof queue !== "string" || !/^[A-Za-z0-9_.$-]{1,200}$/.test(queue)) throw new TypeError("bad queue name");
+  if (messages.length > 100) throw new RangeError("sendBatch takes at most 100 messages");
+  __celld_sql_exec("CREATE TABLE IF NOT EXISTS __celld_outbox(id TEXT PRIMARY KEY, queue TEXT NOT NULL, payload TEXT NOT NULL)", []);
+  let total = 0;
+  for (const m of messages) {
+    const opts = m.options || {};
+    const type = opts.contentType || (typeof m.body === "string" ? "text" : "json");
+    const body = type === "text" ? String(m.body) : JSON.stringify(m.body);
+    if (body.length > 128000) throw new RangeError("a message is at most 128000 bytes");
+    total += body.length;
+    if (total > 256000) throw new RangeError("a batch is at most 256000 bytes");
+    const delay = opts.delaySeconds || 0;
+    if (delay < 0 || delay > 86400) throw new RangeError("delaySeconds is 0 to 86400");
+    const id = __celld_sql_exec("SELECT lower(hex(randomblob(16))) AS id", [])[0].id;
+    const payload = JSON.stringify({ id, body, content_type: type, delay_ms: Math.round(delay * 1000) });
+    __celld_sql_exec("INSERT INTO __celld_outbox VALUES (?, ?, ?)", [id, queue, payload]);
+  }
+};
 const __celld_kv = () => {
   __celld_sql_exec("CREATE TABLE IF NOT EXISTS __celld_kv(k TEXT PRIMARY KEY, v TEXT NOT NULL)");
 };
 const __celld_ctx = {
+  // Messages go to this cell's outbox in the same commit as the rest of the
+  // request, and reach the queue once that commit is durable.
+  queue: (name) => ({
+    send: async (body, options) => __celld_outbox(name, [{ body, options }]),
+    sendBatch: async (messages) => __celld_outbox(name, messages.map((m) => ({ body: m.body, options: m }))),
+  }),
   storage: {
     sql: { exec: (query, ...bindings) => __celld_sql_exec(query, bindings) },
     get(key) {
@@ -69,7 +94,49 @@ globalThis.__celld_dispatch = async (name, input) => {
   const handlers = globalThis.default || globalThis;
   const h = handlers[name];
   if (typeof h !== "function")
-    return name === "alarm" ? "200\n\n" : "501\ntext/plain\nthis class has no fetch handler\n";
+    return name === "alarm" ? "200\n\n" : "501\ntext/plain\nthis class has no " + name + " handler\n";
+  if (name === "scheduled") {
+    const input = JSON.parse(r.body);
+    let noRetry = false;
+    const controller = { cron: input.cron, scheduledTime: input.scheduledTime, noRetry() { noRetry = true; } };
+    try {
+      await h.call(handlers, controller, __celld_ctx);
+      return "200\napplication/json\n{}";
+    } catch (e) {
+      return "500\napplication/json\n" + JSON.stringify({ error: String(e) + (e && e.stack ? "\n" + e.stack : ""), noRetry });
+    }
+  }
+  if (name === "queue") {
+    // A handler that throws has its writes rolled back and its whole batch
+    // retried, acknowledged or not, so no message is lost with its effects.
+    const input = JSON.parse(r.body);
+    const settled = new Map();
+    const messages = input.messages.map((m) => ({
+      id: m.id,
+      timestamp: new Date(m.timestamp),
+      attempts: m.attempts,
+      body: m.contentType === "text" ? m.body : JSON.parse(m.body),
+      ack() { if (!settled.has(m.id)) settled.set(m.id, { ack: true }); },
+      retry(o) { if (!settled.has(m.id)) settled.set(m.id, { ack: false, delay_ms: Math.round(((o && o.delaySeconds) || 0) * 1000) }); },
+    }));
+    const batch = {
+      queue: input.queue,
+      messages,
+      ackAll() { messages.forEach((m) => m.ack()); },
+      retryAll(o) { messages.forEach((m) => m.retry(o)); },
+    };
+    try {
+      await h.call(handlers, batch, __celld_ctx);
+    } catch (e) {
+      return "500\napplication/json\n" + JSON.stringify({ error: String(e) + (e && e.stack ? "\n" + e.stack : "") });
+    }
+    const ack = [], retry = [];
+    for (const m of input.messages) {
+      const s = settled.get(m.id) || { ack: true };
+      if (s.ack) ack.push(m.id); else retry.push({ id: m.id, delay_ms: s.delay_ms });
+    }
+    return "200\napplication/json\n" + JSON.stringify({ ack, retry });
+  }
   let out;
   if (name === "alarm") out = await h.call(handlers, __celld_ctx);
   else {

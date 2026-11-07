@@ -161,7 +161,7 @@ claim its cells.
   `POST /.well-known/celld/drain` stops a node from taking ownership and
   hands off every cell. Once its log is in the bucket, the node writes an
   expired lease with no open log and exits 0, so no one has to recover it.
-- **SQLite cells.** `Sql:<id>` cells run SQLite 3.54.1 (vendored
+- **SQLite cells.** `Sql:<id>` cells run SQLite 3.54.1 (fetched
   amalgamation) inside the unikernel. It is built without threads or an OS
   layer and uses an in-memory VFS that records which pages each write
   touches. Those pages become the commit's LTX file, the same pages celld
@@ -181,6 +181,28 @@ claim its cells.
   Every call has an instruction budget and the runtime has a memory limit,
   so a runaway script fails without stalling the node.
   [examples/chat.js](examples/chat.js) is a chat room.
+- **Queues.** A queue is a cell (`Queue:<name>`) holding its messages in
+  SQLite. A JS cell sends with `ctx.queue(name).send(body, { delaySeconds })`
+  or `sendBatch`. The message goes into the sender's own outbox in the same
+  commit as the rest of the request, and the node delivers it once that
+  commit is durable. A queue therefore never holds a message from a request
+  that failed, and `send()` returns before delivery (celld waits for the
+  queue's commit). `PUT /.well-known/celld/queues/<name>` sets the consumer
+  class and celld's settings: `max_batch_size`, `max_batch_timeout_ms`,
+  `max_retries`, `retry_delay_ms` and `dead_letter_queue`. The consumer's
+  `queue(batch, ctx)` runs in `<Class>:__consumer` with `ack()`, `retry()`,
+  `ackAll()` and `retryAll()`. Delivery is at least once and keeps
+  message ids, and messages are kept for 4 days. A handler that throws has
+  its writes rolled back and its whole batch retried.
+  [examples/queues.js](examples/queues.js).
+- **Cron triggers.** `PUT /.well-known/celld/classes/<Class>/crons` takes
+  newline-separated expressions in Cloudflare's dialect (UTC, weekdays 1-7
+  from Sunday, plus `L`, `W` and `#` forms). The class's `<Class>:__cron` cell
+  runs `scheduled(controller, ctx)` once per occurrence across the fleet,
+  driven by its alarm. A failure retries after 4 s, doubling, at most six
+  times and never past the next occurrence, unless the handler calls
+  `controller.noRetry()`. After downtime one missed occurrence runs.
+  [examples/cron.js](examples/cron.js).
 - **Alarms.** `PUT /do/<cell>/__alarm?in_ms=N` (or `?at_ms=T`) sets the
   cell's one alarm, and `GET` or `DELETE` read or clear it. The alarm is a
   key in the cell's own state, so it is captured, replicated and moves with
@@ -209,7 +231,7 @@ claim its cells.
   bucket stays the root of trust. The protocol version is 6, so nodes
   without peer TLS are not recruited.
 
-The fork leaves out queues, cron, WebSockets and the tunnel. A forwarded request is one signed POST.
+The fork leaves out WebSockets and the tunnel. A forwarded request is one signed POST.
 
 ## Layout
 
@@ -218,6 +240,7 @@ The fork leaves out queues, cron, WebSockets and the tunnel. A forwarded request
 | `lib/logic` | the core: types, phases, `on_event` |
 | `lib/ltx` | the LTX format, CRC-64, and an LZ4 block codec written from the format spec |
 | `lib/cell` | the page store (KV or SQLite), capture, restore planning, GC, and the cell classes |
+| `lib/cron` | Cloudflare-dialect cron expressions: parsing, next occurrence, catch-up |
 | `lib/s3` | SigV4 signing (checked against AWS's published examples), key encoding, ListObjectsV2 parsing |
 | `lib/js` | the JS cell runtime over QuickJS 2026-06-04 (fetched by `scripts/fetch-vendor.sh`): the Solo5 shims it needs, prelude, storage binding, budgets |
 | `lib/sqlite` | SQLite 3.54.1 (fetched by `scripts/fetch-vendor.sh`), an in-memory VFS with dirty-page tracking, limits, and the OCaml binding |
@@ -313,6 +336,11 @@ dune build @runtest --root . --build-dir _build_all
 - **Peer TLS:** a packet capture of a forwarded write showed 358 packets
   of TLS records on port 8081 and none of the request's plaintext, and a
   takeover recovered the dead owner's log over TLS.
+- **Queues and cron:** 7 orders from three nodes reached the consumer in
+  batches of 5 and 2. An order whose handler threw was tried 3 times
+  (`max_retries` 2) and moved to the dead-letter queue. The heartbeat cron
+  ran on two consecutive minute boundaries. Runtime paths get 403 on the
+  public port.
 - **Alarms:** an alarm fired on its owner's timer, an alarm on a cell
   evicted 5 s earlier woke it at e2 and fired once, and an alarm whose
   owner was killed fired on the node that took over. The `alarms/` index

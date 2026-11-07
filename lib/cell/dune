@@ -1,3 +1,3 @@
 (library
  (name celld_cell)
- (libraries celld_ltx celld_sqlite celld_js))
+ (libraries celld_ltx celld_sqlite celld_js celld_cron))
