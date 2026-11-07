@@ -1,9 +1,19 @@
-(** Client for the bucket wire protocol (DESIGN.md, port 9000). *)
+(** Bucket client: the celld-ml bucket's wire protocol (DESIGN.md, port
+    9000), or an S3-compatible store with conditional writes, over TCP or
+    TLS. *)
 
 module Make (S : Tcpip.Stack.V4V6) : sig
   type t
 
-  val create : S.t -> Ipaddr.t -> int -> t
+  type s3 = { bucket : string; creds : Celld_s3.credentials }
+
+  val tls_config : ?fingerprint:string -> host:string -> unit -> (Tls.Config.client, string) result
+  (** Verify the server by a pinned SHA-256 certificate fingerprint (hex,
+      colons allowed), or else against the Mozilla NSS root store. *)
+
+  val create : ?host:string -> ?tls:Tls.Config.client -> ?s3:s3 -> S.t -> Ipaddr.t -> int -> t
+  (** [host] is the Host header and TLS server name (default ip:port).
+      With [s3], requests are path-style and SigV4-signed. *)
 
   type failure =
     | Definite of string  (** certainly not applied *)

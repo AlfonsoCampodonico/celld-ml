@@ -8,6 +8,24 @@ module Make (S : Tcpip.Stack.V4V6) : sig
       it after the reply. Handler exceptions become 500; unparseable input
       gets 400 and the connection is closed. *)
 
+  (** A connected byte stream, so the client runs over TCP or TLS. *)
+  type conn = {
+    write : string -> (unit, string) result Lwt.t;
+    read : unit -> [ `Data of string | `Eof | `Error of string ] Lwt.t;
+    close : unit -> unit Lwt.t;
+  }
+
+  val tcp_connect : S.t -> Ipaddr.t -> int -> (conn, string) result Lwt.t
+
+  val request_over :
+    connect:(unit -> (conn, string) result Lwt.t) ->
+    default_host:string ->
+    ?timeout_ns:int64 ->
+    Celld_http.request ->
+    (Celld_http.response, [ `Connect of string | `Io of string | `Timeout ]) result Lwt.t
+  (** Like {!request}, on a connection from [connect]; a failure inside
+      [connect] is [`Connect]. *)
+
   val request :
     S.t ->
     ?timeout_ns:int64 ->

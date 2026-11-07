@@ -6,6 +6,7 @@ celld_cell
 celld_wire
 celld_http
 celld_http_mirage
+celld_s3
 celld_bucketc
 celld_blocklog
 celld_blocklog_mirage

@@ -80,30 +80,47 @@ module Make (S : Tcpip.Stack.V4V6) = struct
 
   let serve s ~port handler = T.listen (S.tcp s) ~port (handle_flow handler)
 
-  let request s ?(timeout_ns = 10_000_000_000L) ip port (req : Celld_http.request) =
+  (* A connected byte stream: plain TCP here, TLS in the bucket client. *)
+  type conn = {
+    write : string -> (unit, string) result Lwt.t;
+    read : unit -> [ `Data of string | `Eof | `Error of string ] Lwt.t;
+    close : unit -> unit Lwt.t;
+  }
+
+  let tcp_connect s ip port =
+    T.create_connection (S.tcp s) (ip, port) >|= function
+    | Error e -> Error (Fmt.str "%a" T.pp_error e)
+    | Ok flow ->
+        Ok
+          {
+            write = write_string flow;
+            read =
+              (fun () ->
+                T.read flow >|= function
+                | Ok (`Data cs) -> `Data (Cstruct.to_string cs)
+                | Ok `Eof -> `Eof
+                | Error e -> `Error (Fmt.str "%a" T.pp_error e));
+            close = (fun () -> T.close flow);
+          }
+
+  (* One request on a fresh connection from [connect]. A failure before the
+     request could have left is [`Connect]; after, [`Io] or [`Timeout]. *)
+  let request_over ~connect ~default_host ?(timeout_ns = 10_000_000_000L) (req : Celld_http.request) =
     let is_head = String.uppercase_ascii req.meth = "HEAD" in
     let req =
-      let hs =
-        List.filter
-          (fun (k, _) -> String.lowercase_ascii k <> "connection")
-          req.headers
-      in
-      let hs =
-        if Celld_http.header "host" hs = None then
-          ("Host", Ipaddr.to_string ip ^ ":" ^ string_of_int port) :: hs
-        else hs
-      in
+      let hs = List.filter (fun (k, _) -> String.lowercase_ascii k <> "connection") req.headers in
+      let hs = if Celld_http.header "host" hs = None then ("Host", default_host) :: hs else hs in
       { req with headers = hs @ [ ("Connection", "close") ] }
     in
     let sent = ref false in
-    let flow_ref = ref None in
+    let conn_ref = ref None in
     let exchange () =
-      T.create_connection (S.tcp s) (ip, port) >>= function
-      | Error e -> Lwt.return (Error (`Connect (Fmt.str "%a" T.pp_error e)))
-      | Ok flow -> (
-          flow_ref := Some flow;
+      connect () >>= function
+      | Error e -> Lwt.return (Error (`Connect e))
+      | Ok conn -> (
+          conn_ref := Some conn;
           sent := true;
-          write_string flow (Celld_http.serialize_request req) >>= function
+          conn.write (Celld_http.serialize_request req) >>= function
           | Error e -> Lwt.return (Error (`Io ("write: " ^ e)))
           | Ok () ->
               let buf = Buffer.create 4096 in
@@ -111,33 +128,30 @@ module Make (S : Tcpip.Stack.V4V6) = struct
               let rec read_loop () =
                 if Buffer.length buf = 0 || Buffer.length buf < !need then read_more ()
                 else
-                let contents = Buffer.contents buf in
-                match Celld_http.parse_response ~head:is_head contents with
-                | Celld_http.Done (resp, _) -> Lwt.return (Ok resp)
-                | Celld_http.Error e -> Lwt.return (Error (`Io ("parse: " ^ e)))
-                | Celld_http.Partial ->
-                    if not is_head then
-                      (match Celld_http.expected_length contents with
-                      | Some n -> need := n
-                      | None -> need := 0);
-                    read_more ()
+                  let contents = Buffer.contents buf in
+                  match Celld_http.parse_response ~head:is_head contents with
+                  | Celld_http.Done (resp, _) -> Lwt.return (Ok resp)
+                  | Celld_http.Error e -> Lwt.return (Error (`Io ("parse: " ^ e)))
+                  | Celld_http.Partial ->
+                      if not is_head then
+                        (match Celld_http.expected_length contents with Some n -> need := n | None -> need := 0);
+                      read_more ()
               and read_more () =
-                    T.read flow >>= function
-                    | Ok (`Data cs) ->
-                        Buffer.add_string buf (Cstruct.to_string cs);
-                        read_loop ()
-                    | Ok `Eof -> (
-                        match Celld_http.parse_response_eof ~head:is_head (Buffer.contents buf) with
-                        | Celld_http.Done (resp, _) -> Lwt.return (Ok resp)
-                        | Celld_http.Partial -> Lwt.return (Error (`Io "eof before complete response"))
-                        | Celld_http.Error e -> Lwt.return (Error (`Io ("parse: " ^ e))))
-                    | Error e -> Lwt.return (Error (`Io (Fmt.str "read: %a" T.pp_error e)))
+                conn.read () >>= function
+                | `Data d ->
+                    Buffer.add_string buf d;
+                    read_loop ()
+                | `Eof -> (
+                    match Celld_http.parse_response_eof ~head:is_head (Buffer.contents buf) with
+                    | Celld_http.Done (resp, _) -> Lwt.return (Ok resp)
+                    | Celld_http.Partial -> Lwt.return (Error (`Io "eof before complete response"))
+                    | Celld_http.Error e -> Lwt.return (Error (`Io ("parse: " ^ e))))
+                | `Error e -> Lwt.return (Error (`Io ("read: " ^ e)))
               in
               read_loop ())
     in
     let timeout () =
-      Mirage_sleep.ns timeout_ns >|= fun () ->
-      if !sent then Error `Timeout else Error (`Connect "connect timeout")
+      Mirage_sleep.ns timeout_ns >|= fun () -> if !sent then Error `Timeout else Error (`Connect "connect timeout")
     in
     Lwt.catch
       (fun () -> Lwt.pick [ exchange (); timeout () ])
@@ -145,8 +159,12 @@ module Make (S : Tcpip.Stack.V4V6) = struct
         let m = Printexc.to_string exn in
         Lwt.return (if !sent then Error (`Io m) else Error (`Connect m)))
     >>= fun result ->
-    (match !flow_ref with
-    | Some flow -> Lwt.async (fun () -> Lwt.catch (fun () -> T.close flow) (fun _ -> Lwt.return_unit))
+    (match !conn_ref with
+    | Some c -> Lwt.async (fun () -> Lwt.catch c.close (fun _ -> Lwt.return_unit))
     | None -> ());
     Lwt.return result
+
+  let request s ?timeout_ns ip port req =
+    request_over ~connect:(fun () -> tcp_connect s ip port)
+      ~default_host:(Ipaddr.to_string ip ^ ":" ^ string_of_int port) ?timeout_ns req
 end

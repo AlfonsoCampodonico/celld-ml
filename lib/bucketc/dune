@@ -1,4 +1,17 @@
 (library
  (name celld_bucketc)
  (optional)
- (libraries celld_http celld_http_mirage lwt tcpip ipaddr mirage-sleep logs))
+ (libraries
+  celld_http
+  celld_http_mirage
+  celld_s3
+  lwt
+  tcpip
+  ipaddr
+  mirage-sleep
+  mirage-ptime
+  tls-mirage
+  x509
+  ca-certs-nss
+  domain-name
+  logs))

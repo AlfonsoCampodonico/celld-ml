@@ -26,13 +26,55 @@ extern void celld_sql_reset_budget(void);
 #define MEMORY_LIMIT ((size_t)32 << 20) /* per cell */
 #define STACK_LIMIT ((size_t)256 << 10)
 #define CALL_BUDGET 20000 /* interrupt checks per call */
+#define MAX_JOBS 10000    /* promise jobs per call */
 
 struct cell {
   JSRuntime *rt;
   JSContext *ctx;
-  sqlite3 *db; /* NULL once disposed */
+  sqlite3 *db;  /* NULL once disposed */
   int budget;
+  int poisoned; /* jobs were left queued: the context must be rebuilt */
 };
+
+/* Allocator with a size header, so the memory limit counts real bytes on
+   every libc (Solo5's has no malloc_usable_size). The header keeps
+   16-byte alignment. */
+#define HDR 16
+
+static void *cm_malloc(JSMallocState *s, size_t size) {
+  if (s->malloc_size + size + HDR > s->malloc_limit) return NULL;
+  unsigned char *p = malloc(size + HDR);
+  if (!p) return NULL;
+  *(size_t *)p = size;
+  s->malloc_count++;
+  s->malloc_size += size + HDR;
+  return p + HDR;
+}
+
+static size_t cm_usable(const void *ptr) {
+  return ptr ? *(const size_t *)((const unsigned char *)ptr - HDR) : 0;
+}
+
+static void cm_free(JSMallocState *s, void *ptr) {
+  if (!ptr) return;
+  s->malloc_count--;
+  s->malloc_size -= cm_usable(ptr) + HDR;
+  free((unsigned char *)ptr - HDR);
+}
+
+static void *cm_realloc(JSMallocState *s, void *ptr, size_t size) {
+  if (!ptr) return size ? cm_malloc(s, size) : NULL;
+  if (size == 0) { cm_free(s, ptr); return NULL; }
+  size_t old = cm_usable(ptr);
+  if (size > old && s->malloc_size + (size - old) > s->malloc_limit) return NULL;
+  unsigned char *p = realloc((unsigned char *)ptr - HDR, size + HDR);
+  if (!p) return NULL;
+  *(size_t *)p = size;
+  s->malloc_size = s->malloc_size - old + size;
+  return p + HDR;
+}
+
+static const JSMallocFunctions counted_malloc = { cm_malloc, cm_free, cm_realloc, cm_usable };
 
 static int on_interrupt(JSRuntime *r, void *opaque) {
   (void)r;
@@ -47,13 +89,16 @@ static void enter(struct cell *c) {
   JS_UpdateStackTop(c->rt);
 }
 
-/* Run queued jobs to completion. After a failure the rest still run (on a
-   spent budget they stop fast), so nothing is left for the next call. */
+/* Run queued jobs, at most MAX_JOBS and only while budget remains: a chain
+   of tiny jobs may never reach an interrupt check. Jobs left behind would
+   run during the next call, so the cell is poisoned and its context rebuilt
+   before it serves again. */
 static int drain(struct cell *c, JSContext **failed) {
   JSContext *jctx;
-  int rc, ok = 1;
-  while ((rc = JS_ExecutePendingJob(c->rt, &jctx)) != 0)
+  int rc, ok = 1, n = 0;
+  while (n++ < MAX_JOBS && c->budget > 0 && (rc = JS_ExecutePendingJob(c->rt, &jctx)) != 0)
     if (rc < 0 && ok) { ok = 0; *failed = jctx; }
+  if (JS_IsJobPending(c->rt)) c->poisoned = 1;
   return ok;
 }
 
@@ -195,7 +240,7 @@ CAMLprim value celld_js_create(value prelude, value script, value conn) {
   struct cell *c = calloc(1, sizeof *c);
   if (!c) caml_raise_out_of_memory();
   c->db = celld_sql_handle(conn);
-  c->rt = JS_NewRuntime();
+  c->rt = JS_NewRuntime2(&counted_malloc, NULL);
   if (!c->rt) { free(c); CAMLreturn(error_of(NULL)); }
   JS_SetMemoryLimit(c->rt, MEMORY_LIMIT);
   JS_SetMaxStackSize(c->rt, STACK_LIMIT);
@@ -225,6 +270,12 @@ CAMLprim value celld_js_call(value cv, value name, value req) {
   CAMLlocal1(r);
   struct cell *c = Cell_val(cv);
   if (!c) caml_failwith("js: cell disposed");
+  if (c->poisoned) {
+    static const char msg[] = "poisoned: earlier promise jobs never finished";
+    char *m = malloc(sizeof msg);
+    if (m) memcpy(m, msg, sizeof msg);
+    CAMLreturn(error_of(m));
+  }
   JSContext *ctx = c->ctx;
   enter(c);
   JSValue g = JS_GetGlobalObject(ctx);
@@ -245,6 +296,13 @@ CAMLprim value celld_js_call(value cv, value name, value req) {
   if (!drain(c, &failed)) {
     JS_FreeValue(ctx, p);
     CAMLreturn(error_of(exception_text(failed)));
+  }
+  if (c->poisoned) {
+    JS_FreeValue(ctx, p);
+    static const char msg[] = "too many promise jobs in one call";
+    char *m = malloc(sizeof msg);
+    if (m) memcpy(m, msg, sizeof msg);
+    CAMLreturn(error_of(m));
   }
   JSValue out;
   switch (JS_PromiseState(ctx, p)) {
@@ -272,6 +330,11 @@ CAMLprim value celld_js_call(value cv, value name, value req) {
   Store_field(r, 0, caml_alloc_initialized_string(n, s));
   JS_FreeCString(ctx, s);
   CAMLreturn(r);
+}
+
+CAMLprim value celld_js_poisoned(value cv) {
+  struct cell *c = Cell_val(cv);
+  return Val_bool(c == NULL || c->poisoned);
 }
 
 CAMLprim value celld_js_dispose(value cv) {

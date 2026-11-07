@@ -22,7 +22,13 @@ let arg name doc c default =
 
 let node_id = arg "node-id" "This node's id." Cmdliner.Arg.string "node"
 let advertise = arg "advertise" "ip:port where peers reach this node's internal listener." Cmdliner.Arg.string "10.0.0.11:8081"
-let bucket_addr = arg "bucket" "ip:port of the bucket." Cmdliner.Arg.string "10.0.0.2:9000"
+let bucket_addr = arg "bucket" "ip:port of the celld-ml bucket, or s3://ip:port/bucket for an S3-compatible store." Cmdliner.Arg.string "10.0.0.2:9000"
+let s3_host = arg "s3-host" "Host header and TLS server name for S3 (default: the address)." Cmdliner.Arg.string ""
+let s3_region = arg "s3-region" "S3 signing region." Cmdliner.Arg.string "us-east-1"
+let s3_access_key = arg "s3-access-key" "S3 access key id." Cmdliner.Arg.string ""
+let s3_secret_key = arg "s3-secret-key" "S3 secret access key." Cmdliner.Arg.string ""
+let s3_tls = arg "s3-tls" "Talk to S3 over TLS." Cmdliner.Arg.bool false
+let s3_tls_fingerprint = arg "s3-tls-fingerprint" "Pin the S3 server certificate by SHA-256 fingerprint (hex) instead of trusting the Mozilla root store." Cmdliner.Arg.string ""
 let ttl_ms = arg "ttl-ms" "Node lease lifetime." Cmdliner.Arg.int 10_000
 let idle_ms = arg "idle-ms" "Evict a cell idle this long." Cmdliner.Arg.int 30_000
 let durability = arg "durability" "fleet or bucket." Cmdliner.Arg.string "fleet"
@@ -78,7 +84,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
     store : Store.t;
     epoch : int;
     mutable snap_txid : int;  (** last snapshot the bucket has *)
-    js : Celld_js.t option;  (** the class script's context, for JS classes *)
+    mutable js : Celld_js.t option;  (** the class script's context, for JS classes *)
+    script : string;
   }
 
   type t = {
@@ -463,7 +470,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
                    B.get t.bucket (class_key (Handlers.class_of cell)) >|= function
                    | Ok (Some (script, _)) -> (
                        match store.sql with
-                       | Some db -> Result.map Option.some (Celld_js.create ~script ~db)
+                       | Some db -> Result.map (fun js -> Some (js, script)) (Celld_js.create ~script ~db)
                        | None -> Error "JS cell without a database")
                    | Ok None -> Error ("no script for class " ^ Handlers.class_of cell ^ "; PUT it to /.well-known/celld/classes/" ^ Handlers.class_of cell)
                    | Error f -> Error (string_of_failure (fail_of f))
@@ -471,7 +478,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
                 >>= function
                 | Error e -> Lwt.return (Error e)
                 | Ok js ->
-                Hashtbl.replace t.runtimes cell { store; epoch; snap_txid = Int64.to_int store.txid; js };
+                Hashtbl.replace t.runtimes cell
+                  { store; epoch; snap_txid = Int64.to_int store.txid; js = Option.map fst js; script = (match js with Some (_, s) -> s | None -> "") };
                 (* Each epoch opens with a snapshot of what it restored. *)
                 if store.txid > 0L then capture t cell epoch store.txid (Store.snapshot store);
                 Log.info (fun m -> m "restored %s at e%d (txid %Ld, %d files)" cell epoch store.txid (List.length ok));
@@ -694,6 +702,14 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         let now = now_ms () in
         Celld_sqlite.set_now (Int64.of_int now);
         let reply = handler rt.store ~now_ms:now ~meth ~path ~query ~body in
+        (* A call that left promise jobs behind poisons its context. *)
+        (match rt.js, rt.store.sql with
+        | Some js, Some db when Celld_js.poisoned js -> (
+            Celld_js.dispose js;
+            match Celld_js.create ~script:rt.script ~db with
+            | Ok fresh -> rt.js <- Some fresh; Log.warn (fun m -> m "%s: rebuilt a poisoned JS context" cell)
+            | Error e -> rt.js <- None; Log.err (fun m -> m "%s: cannot rebuild JS context: %s" cell e))
+        | _ -> ());
         let position =
           if reply.wrote then begin
             let txid, ltx = Store.commit rt.store in
@@ -867,13 +883,34 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         B.put bucket ~guard:B.Absent Wire.peer_auth_key (Wire.to_string (Wire.Obj [ ("secret", Str secret) ])) >>= function
         | Ok (`Ok _) -> Lwt.return secret
         | _ -> peer_secret bucket)
-    | Error _ -> sleep_ms 500 >>= fun () -> peer_secret bucket
+    | Error f ->
+        Log.warn (fun m -> m "cannot read the fleet secret from the bucket (%s); retrying" (string_of_failure (fail_of f)));
+        sleep_ms 2_000 >>= fun () -> peer_secret bucket
 
   let start stack blk =
     let me = node_id () in
     D.open_ blk >>= fun (disk, records) ->
-    let bip, bport = parse_addr (bucket_addr ()) in
-    let bucket = B.create stack bip bport in
+    let bucket =
+      let b = bucket_addr () in
+      if String.length b > 5 && String.sub b 0 5 = "s3://" then begin
+        let rest = String.sub b 5 (String.length b - 5) in
+        let addr, name = match String.index_opt rest '/' with Some i -> (String.sub rest 0 i, String.sub rest (i + 1) (String.length rest - i - 1)) | None -> invalid_arg "--bucket=s3://ip:port/bucket" in
+        let ip, port = parse_addr addr in
+        let host = if s3_host () = "" then addr else s3_host () in
+        let tls =
+          if not (s3_tls ()) then None
+          else
+            match B.tls_config ?fingerprint:(if s3_tls_fingerprint () = "" then None else Some (s3_tls_fingerprint ())) ~host () with
+            | Ok c -> Some c
+            | Error e -> failwith ("TLS configuration: " ^ e)
+        in
+        let creds = { Celld_s3.access_key = s3_access_key (); secret_key = s3_secret_key (); region = s3_region () } in
+        B.create ~host ?tls ~s3:{ B.bucket = name; creds } stack ip port
+      end
+      else
+        let ip, port = parse_addr b in
+        B.create stack ip port
+    in
     let session = random_hex 8 in
     Celld_sqlite.seed (Mirage_crypto_rng.generate 32);
     let config = { default_config with ttl_ms = ttl_ms (); idle_ms = idle_ms () } in

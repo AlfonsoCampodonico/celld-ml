@@ -13,6 +13,10 @@ let packages =
     package "mirage-runtime";
     package "mirage-crypto-rng";
     package "mirage-block";
+    package "tls-mirage";
+    package "x509";
+    package "ca-certs-nss";
+    package "domain-name";
     package "digestif";
     package "cmdliner";
     package "logs";

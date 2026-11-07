@@ -14,6 +14,10 @@ external create_raw : string -> string -> Celld_sqlite.db -> (t, string) result 
 external call_raw : t -> string -> string -> (string, string) result = "celld_js_call"
 external dispose : t -> unit = "celld_js_dispose"
 
+(* After a call left promise jobs queued, a context only answers with an
+   error: dispose it and create a new one from the script. *)
+external poisoned : t -> bool = "celld_js_poisoned"
+
 let prelude =
   {js|
 "use strict";

@@ -42,7 +42,7 @@ start_node() { # i args...
   [ -f "$run/n$i.img" ] || truncate -s "${LOG_SIZE:-64M}" "$run/n$i.img"
   boot "n$i" "tap$i" node "--block:log=$run/n$i.img" "$root/unikernels/node/dist/node.hvt" \
     "--ipv4=10.0.0.1$i/24" --ipv4-gateway=10.0.0.1 "--node-id=n$i" "--advertise=10.0.0.1$i:8081" \
-    --bucket=10.0.0.2:9000 "$@"
+    "--bucket=${NODE_BUCKET:-10.0.0.2:9000}" ${NODE_ARGS:-} "$@"
   wait_for "n$i" "celld-ml node"
 }
 

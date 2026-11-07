@@ -55,3 +55,18 @@ let () =
   check "cell usable after errors" (match call b "/" with Ok r -> r.body = "b" | _ -> false);
   Celld_js.dispose a;
   Celld_js.dispose b
+
+(* A promise chain that never ends is cut off and poisons the context; a
+   memory hog is held to the limit by the counting allocator. *)
+let () =
+  let db = Celld_sqlite.open_image "" in
+  let t =
+    match Celld_js.create ~db ~script:{|function fetch() { const loop = () => Promise.resolve().then(loop); loop(); return "started"; }|} with
+    | Ok t -> t
+    | Error e -> failwith e
+  in
+  let call () = Celld_js.call t ~name:"fetch" ~cell:"X:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" in
+  (match call () with Error _ -> check "endless promise chain is cut off" true | Ok _ -> check "endless promise chain" false);
+  check "context is poisoned" (Celld_js.poisoned t);
+  (match call () with Error e -> check "poisoned context refuses calls" (String.sub e 0 8 = "poisoned") | Ok _ -> check "poisoned" false);
+  Celld_js.dispose t
