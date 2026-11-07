@@ -1,3 +1,5 @@
+let () = Mirage_crypto_rng_unix.use_default ()
+
 let check name c = if not c then (Printf.printf "FAIL %s\n" name; exit 1) else Printf.printf "ok   %s\n" name
 
 let script =
@@ -175,3 +177,166 @@ let () =
       match Celld_js.call_sync t ~name:"fetch" ~cell:"X:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" with
       | Ok r -> check "HMAC args are copied before user code runs" (r.body = "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
       | Error e -> check e false)
+
+
+(* Node.js subset, streams, HTMLRewriter and Web Crypto beyond HMAC. *)
+let () =
+  let db = Celld_sqlite.open_image "" in
+  let t =
+    match
+      Celld_js.create ~db
+        ~script:
+          {|async function fetch(request) {
+              const out = {};
+              const { Buffer } = require("node:buffer");
+              const b = Buffer.from("héllo");
+              out.buf = [b.toString("hex"), Buffer.from(b.toString("base64"), "base64").toString(), Buffer.concat([Buffer.from("a"), Buffer.from("b")]).toString()];
+              const EventEmitter = require("events");
+              const em = new EventEmitter(); let got = 0; em.once("x", (v) => (got += v)); em.emit("x", 2); em.emit("x", 5);
+              out.events = got;
+              out.path = require("path").join("/a/b", "../c", "d.txt");
+              out.hash = require("crypto").createHash("sha256").update("abc").digest("hex").slice(0, 8);
+              const up = new TransformStream({ transform(c, ctl) { ctl.enqueue(new TextDecoder().decode(c).toUpperCase()); } });
+              const piped = new Response("stream me").body.pipeThrough(up);
+              let s = ""; for await (const c of piped) s += c;
+              out.stream = s;
+              const [x, y] = new Response("tee").body.tee();
+              out.tee = (await new Response(x).text()) + (await new Response(y).text());
+              const enc = new ReadableStream({ start(c) { c.enqueue("te"); c.enqueue("xt"); c.close(); } }).pipeThrough(new TextEncoderStream());
+              out.textstream = (await new Response(enc).text()).length;
+              const html = await new HTMLRewriter()
+                .on("a[href^='http']", { element(e) { e.setAttribute("target", "_blank"); } })
+                .on("div.ad", { element(e) { e.remove(); } })
+                .on("ul > li", { element(e) { e.append("!"); } })
+                .on("p", { text(t) { if (t.text.includes("old")) t.replace("new"); } })
+                .on("#title", { element(e) { e.setInnerContent("<b>Hi</b>", { html: true }); } })
+                .transform(new Response('<h1 id="title">x</h1><p>old text</p><a href="https://x">l</a><div class="ad"><span>buy</span></div><ul><li>one</li></ul>'))
+                .text();
+              out.html = html;
+              const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+              const iv = crypto.getRandomValues(new Uint8Array(12));
+              const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode("secret"));
+              out.aes = new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct));
+              const bad = new Uint8Array(ct); bad[0] ^= 1;
+              out.aesTamper = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, bad).then(() => "accepted", () => "rejected");
+              const kp = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+              const sig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, kp.privateKey, new TextEncoder().encode("msg"));
+              const jwk = await crypto.subtle.exportKey("jwk", kp.publicKey);
+              const pub2 = await crypto.subtle.importKey("jwk", jwk, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]);
+              out.ecdsa = [await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, pub2, sig, new TextEncoder().encode("msg")),
+                           await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, pub2, sig, new TextEncoder().encode("other"))];
+              const a = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+              const c = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+              const s1 = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: c.publicKey }, a.privateKey, 256));
+              const s2 = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: a.publicKey }, c.privateKey, 256));
+              out.ecdh = s1.length === 32 && s1.every((v, i) => v === s2[i]);
+              return Response.json(out);
+            }|}
+    with
+    | Ok t -> t
+    | Error e -> failwith e
+  in
+  match Celld_js.call_sync t ~name:"fetch" ~cell:"N:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" with
+  | Error e -> check e false
+  | Ok r ->
+      let has k = let n = String.length k in let rec go i = i + n <= String.length r.body && (String.sub r.body i n = k || go (i + 1)) in go 0 in
+      check "Buffer hex, base64 and concat" (has {|"buf":["68c3a96c6c6f","héllo","ab"]|});
+      check "EventEmitter once" (has {|"events":2|});
+      check "path.join" (has {|"path":"/a/c/d.txt"|});
+      check "require('crypto').createHash" (has {|"hash":"ba7816bf"|});
+      check "TransformStream through pipeThrough" (has {|"stream":"STREAM ME"|});
+      check "tee" (has {|"tee":"teetee"|});
+      check "TextEncoderStream" (has {|"textstream":4|});
+      check "HTMLRewriter attributes, remove, append, text and inner content"
+        (has {|<h1 id=\"title\"><b>Hi</b></h1><p>new</p><a href=\"https://x\" target=\"_blank\">l</a><ul><li>one!</li></ul>|});
+      check "AES-GCM round trip and tamper detection" (has {|"aes":"secret","aesTamper":"rejected"|});
+      check "ECDSA P-256 with a JWK round trip" (has {|"ecdsa":[true,false]|});
+      check "ECDH agreement" (has {|"ecdh":true|})
+
+(* The event loop: two calls on one context interleave while one awaits. *)
+let () =
+  let db = Celld_sqlite.open_image "" in
+  let t =
+    match
+      Celld_js.create ~db
+        ~script:
+          {|async function fetch(request, ctx) {
+              if (request.path === "/slow") { await new Promise((r) => setTimeout(r, 50)); return new Response("slow done"); }
+              return new Response("fast");
+            }|}
+    with
+    | Ok t -> t
+    | Error e -> failwith e
+  in
+  let start call path =
+    let input = Printf.sprintf {|{"cell":"L:1","method":"GET","path":"%s","query":{},"headers":{},"sockets":[],"body_b64":""}|} path in
+    ignore (Celld_js.invoke t "__celld_start" (Printf.sprintf {|{"call":%d,"name":"fetch","input":%s}|} call (Celld_js.json_str input)))
+  in
+  let poll () = match Celld_js.invoke t "__celld_poll" "" with Ok s -> s | Error e -> failwith e in
+  start 1 "/slow";
+  let p1 = poll () in
+  start 2 "/fast";
+  let p2 = poll () in
+  let has s k = let n = String.length k in let rec go i = i + n <= String.length s && (String.sub s i n = k || go (i + 1)) in go 0 in
+  check "a waiting call reports its operation" (has p1 {|"kind":"sleep"|} && has p1 {|"done":[]|});
+  check "a second call finishes while the first waits" (has p2 {|"call":2|});
+  let op = match String.index_opt p1 '_' with Some _ -> 1 | None -> 0 in
+  ignore (Celld_js.invoke t "__celld_resume" (Printf.sprintf {|[{"_op":%d,"value":null}]|} op));
+  check "the first call finishes once resumed" (has (poll ()) {|"call":1|})
+
+(* A class script may bind Node names itself, as Node code does. *)
+let () =
+  let db = Celld_sqlite.open_image "" in
+  match Celld_js.create ~db ~script:{|const { Buffer } = require("node:buffer"); const EventEmitter = require("events"); function fetch() { return Buffer.from("ok").toString(); }|} with
+  | Error e -> check ("script binds Buffer itself: " ^ e) false
+  | Ok t -> check "a script may bind Buffer and EventEmitter itself" (match Celld_js.call_sync t ~name:"fetch" ~cell:"B:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" with Ok r -> r.body = "ok" | Error _ -> false)
+
+(* WebAssembly: a hand-assembled module with an import, exports, memory
+   with a data segment, and an infinite loop that the budget stops. *)
+let () =
+  let db = Celld_sqlite.open_image "" in
+  let wasm =
+    "0061736d01000000" ^ "010e03" ^ "60027f7f017f" ^ "60017f00" ^ "600000"
+    ^ "020b0103656e76036c6f67" ^ "0001" ^ "0304030001" ^ "02" ^ "0503010001"
+    ^ "072104036164640001" ^ "0763616c6c4c6f670002" ^ "047370696e0003" ^ "066d656d6f72790200"
+    ^ "0a1b03" ^ "070020002001" ^ "6a0b" ^ "09002000410" ^ "16a10000b" ^ "07000340" ^ "0c000b0b"
+    ^ "0b080100410" ^ "00b026869"
+  in
+  let hex = String.concat "" (List.init (String.length wasm / 2) (fun i -> Printf.sprintf "0x%s," (String.sub wasm (2 * i) 2))) in
+  let script =
+    Printf.sprintf
+      {|async function fetch() {
+          const bytes = new Uint8Array([%s]);
+          const logged = [];
+          const out = { valid: WebAssembly.validate(bytes), invalid: WebAssembly.validate(new Uint8Array([0, 1, 2])) };
+          const { instance } = await WebAssembly.instantiate(bytes, { env: { log: (x) => logged.push(x) } });
+          out.add = instance.exports.add(2, 40);
+          instance.exports.callLog(41);
+          out.logged = logged;
+          const mem = new Uint8Array(instance.exports.memory.buffer);
+          out.data = String.fromCharCode(mem[0], mem[1]);
+          out.pages = instance.exports.memory.grow(1);
+          out.detached = mem.length === 0;
+          out.grown = instance.exports.memory.buffer.byteLength;
+          try { instance.exports.spin(); out.spin = "returned"; } catch (e) { out.spin = e.name + ": " + e.message; }
+          out.after = instance.exports.add(1, 1);
+          try { new WebAssembly.Instance(new WebAssembly.Module(bytes), {}); } catch (e) { out.link = e.name; }
+          return Response.json(out);
+        }|}
+      hex
+  in
+  match Celld_js.create ~db ~script with
+  | Error e -> check ("wasm script: " ^ e) false
+  | Ok t -> (
+      match Celld_js.call_sync t ~name:"fetch" ~cell:"W:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" with
+      | Error e -> check ("wasm: " ^ e) false
+      | Ok r ->
+          let has k = let n = String.length k in let rec go i = i + n <= String.length r.body && (String.sub r.body i n = k || go (i + 1)) in go 0 in
+          if not (has {|"add":42|}) then print_endline r.body;
+          check "WebAssembly validate" (has {|"valid":true,"invalid":false|});
+          check "WebAssembly exports and imports" (has {|"add":42|} && has {|"logged":[42]|});
+          check "WebAssembly memory and data segments" (has {|"data":"hi"|});
+          check "memory.grow detaches the old view" (has {|"pages":1,"detached":true,"grown":131072|});
+          check "an infinite loop is stopped by the budget" (has {|"spin":"RuntimeError: [trap] WebAssembly instruction budget exhausted"|});
+          check "the instance works after a trap" (has {|"after":2|});
+          check "a missing import is a LinkError" (has {|"link":"LinkError"|}))

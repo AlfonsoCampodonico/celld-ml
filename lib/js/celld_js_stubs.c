@@ -14,6 +14,12 @@
 #include <stdint.h>
 #include "quickjs.h"
 #include "sqlite3.h"
+/* wasm3's internal headers and OCaml's both define code_t (a typedef
+   only), so wasm3's is renamed while it is included here. */
+#define code_t m3_code_t
+#include "wasm3.h"
+#include "m3_env.h"
+#undef code_t
 
 #include <caml/mlvalues.h>
 #include <caml/alloc.h>
@@ -37,6 +43,25 @@ struct cell {
   int budget;
   int poisoned; /* jobs were left queued: the context must be rebuilt */
   JSValue pending; /* the dispatch promise of a suspended call, or undefined */
+  IM3Environment wenv;            /* WebAssembly, created on first use */
+  struct winst *wasm[16];
+  int nwasm;
+  JSValue wasm_exc;               /* an exception thrown by an import, to rethrow */
+};
+
+/* One WebAssembly instance: its runtime (which owns the module), the bytes
+   the module was parsed from, its imports, and the one ArrayBuffer that
+   aliases its memory. The buffer is detached whenever the memory moves or
+   resizes, so JS never holds a dangling view. */
+struct wimport { struct cell *c; JSValue fn; IM3FuncType type; };
+struct winst {
+  IM3Runtime rt;
+  uint8_t *bytes;
+  struct wimport *imports;
+  int nimports;
+  JSValue buf;
+  uint8_t *buf_ptr;
+  uint32_t buf_len;
 };
 
 /* Allocator with a size header, so the memory limit counts real bytes on
@@ -112,8 +137,24 @@ static int drain(struct cell *c, JSContext **failed) {
 
 #define Cell_val(v) (*((struct cell **)Data_custom_val(v)))
 
+static void wasm_free(struct cell *c) {
+  for (int i = 0; i < c->nwasm; i++) {
+    struct winst *w = c->wasm[i];
+    if (!JS_IsUndefined(w->buf)) { JS_DetachArrayBuffer(c->ctx, w->buf); JS_FreeValue(c->ctx, w->buf); }
+    for (int j = 0; j < w->nimports; j++) JS_FreeValue(c->ctx, w->imports[j].fn);
+    if (w->rt) m3_FreeRuntime(w->rt);
+    free(w->imports);
+    free(w->bytes);
+    free(w);
+  }
+  c->nwasm = 0;
+  if (!JS_IsUndefined(c->wasm_exc)) { JS_FreeValue(c->ctx, c->wasm_exc); c->wasm_exc = JS_UNDEFINED; }
+  if (c->wenv) { m3_FreeEnvironment(c->wenv); c->wenv = NULL; }
+}
+
 static void cell_free(struct cell *c) {
   c->db = NULL;
+  if (c->ctx) wasm_free(c);
   if (c->ctx && !JS_IsUndefined(c->pending)) JS_FreeValue(c->ctx, c->pending);
   c->pending = JS_UNDEFINED;
   if (c->ctx) {
@@ -343,6 +384,331 @@ static JSValue js_hash(JSContext *ctx, int argc, JSValueConst *argv, int hmac) {
   free(d);
   return out;
 }
+/* __celld_crypto(op, ...args) -> ArrayBuffer: AES-GCM and P-256 in OCaml
+   (mirage-crypto). The callback answers "O" ^ result or "E" ^ message.
+   Every argument is copied before the next is converted. */
+static JSValue js_crypto(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  if (argc < 1 || argc > 5) return JS_ThrowTypeError(ctx, "bad crypto call");
+  const value *f = caml_named_value("celld_js_crypto");
+  if (!f) return JS_ThrowTypeError(ctx, "no crypto support");
+  const char *op_js = JS_ToCString(ctx, argv[0]);
+  if (!op_js) return JS_EXCEPTION;
+  char op[32];
+  size_t ol = strlen(op_js);
+  if (ol >= sizeof op) ol = sizeof op - 1;
+  memcpy(op, op_js, ol);
+  op[ol] = 0;
+  JS_FreeCString(ctx, op_js);
+  uint8_t *args[4] = { NULL, NULL, NULL, NULL };
+  size_t lens[4] = { 0, 0, 0, 0 };
+  int n = argc - 1;
+  for (int i = 0; i < n; i++) {
+    args[i] = bytes_copy(ctx, argv[i + 1], &lens[i]);
+    if (!args[i]) { for (int j = 0; j < i; j++) free(args[j]); return JS_EXCEPTION; }
+  }
+  JSValue out;
+  {
+    CAMLparam0();
+    CAMLlocal4(o, list, cell, r);
+    o = caml_copy_string(op);
+    list = Val_emptylist;
+    for (int i = n - 1; i >= 0; i--) {
+      cell = caml_alloc(2, 0);
+      Store_field(cell, 0, ocaml_bytes(args[i], lens[i]));
+      Store_field(cell, 1, list);
+      list = cell;
+    }
+    r = caml_callback2(*f, o, list);
+    size_t rl = caml_string_length(r);
+    const char *rs = String_val(r);
+    if (rl == 0 || rs[0] != 'O') {
+      char msg[256];
+      size_t ml = rl > 1 ? rl - 1 : 0;
+      if (ml >= sizeof msg) ml = sizeof msg - 1;
+      if (ml) memcpy(msg, rs + 1, ml);
+      msg[ml] = 0;
+      out = JS_ThrowTypeError(ctx, "%s", ml ? msg : "crypto operation failed");
+    } else
+      out = JS_NewArrayBufferCopy(ctx, (const uint8_t *)rs + 1, rl - 1);
+    CAMLdrop;
+  }
+  for (int i = 0; i < n; i++) free(args[i]);
+  return out;
+}
+
+
+/* ---- WebAssembly on wasm3 ----
+   Interpreted, so it runs where a JIT cannot. Each call has an instruction
+   budget, charged on calls and loop back-edges (m3_Yield; the vendored
+   wasm3 is patched to yield on loops), so a runaway module traps instead
+   of stalling the node. Memory is capped per instance. */
+
+#define WASM_BUDGET 20000000
+#define WASM_MEMORY_LIMIT (64u << 20)
+static int wasm_budget = WASM_BUDGET;
+static int wasm_depth = 0;
+
+M3Result m3_Yield(void) {
+  return --wasm_budget <= 0 ? "[trap] WebAssembly instruction budget exhausted" : m3Err_none;
+}
+
+static void no_free(JSRuntime *rt, void *opaque, void *ptr) { (void)rt; (void)opaque; (void)ptr; }
+
+/* Detach the memory view if the memory moved or resized. */
+static void wasm_check_memory(struct cell *c, struct winst *w) {
+  if (JS_IsUndefined(w->buf)) return;
+  uint32_t len = 0;
+  uint8_t *p = m3_GetMemory(w->rt, &len, 0);
+  if (p != w->buf_ptr || len != w->buf_len) {
+    JS_DetachArrayBuffer(c->ctx, w->buf);
+    JS_FreeValue(c->ctx, w->buf);
+    w->buf = JS_UNDEFINED;
+  }
+}
+
+static void wasm_check_all(struct cell *c) { for (int i = 0; i < c->nwasm; i++) wasm_check_memory(c, c->wasm[i]); }
+
+static JSValue wasm_value(JSContext *ctx, uint8_t type, void *slot) {
+  switch (type) {
+  case c_m3Type_i32: return JS_NewInt32(ctx, *(int32_t *)slot);
+  case c_m3Type_i64: return JS_NewBigInt64(ctx, *(int64_t *)slot);
+  case c_m3Type_f32: return JS_NewFloat64(ctx, *(float *)slot);
+  case c_m3Type_f64: return JS_NewFloat64(ctx, *(double *)slot);
+  default: return JS_UNDEFINED;
+  }
+}
+
+/* JS value -> wasm slot. Returns 0 on success. */
+static int wasm_slot(JSContext *ctx, uint8_t type, JSValueConst v, void *slot) {
+  switch (type) {
+  case c_m3Type_i32: { int32_t x; if (JS_ToInt32(ctx, &x, v)) return -1; *(int32_t *)slot = x; return 0; }
+  case c_m3Type_i64: { int64_t x; if (JS_ToBigInt64(ctx, &x, v) && JS_ToInt64(ctx, &x, v)) return -1; JS_FreeValue(ctx, JS_GetException(ctx)); *(int64_t *)slot = x; return 0; }
+  case c_m3Type_f32: { double x; if (JS_ToFloat64(ctx, &x, v)) return -1; *(float *)slot = (float)x; return 0; }
+  case c_m3Type_f64: { double x; if (JS_ToFloat64(ctx, &x, v)) return -1; *(double *)slot = x; return 0; }
+  default: return -1;
+  }
+}
+
+/* An imported function: call the JS function it was linked to. */
+static m3ApiRawFunction(wasm_import_trampoline) {
+  (void)runtime; (void)_mem;
+  struct wimport *imp = (struct wimport *)_ctx->userdata;
+  struct cell *c = imp->c;
+  JSContext *ctx = c->ctx;
+  IM3FuncType ft = imp->type;
+  wasm_check_all(c); /* JS is about to run: no stale memory views */
+  int n = ft->numArgs > 16 ? 16 : ft->numArgs;
+  JSValue argv[16];
+  uint64_t *args = _sp + ft->numRets;
+  for (int i = 0; i < n; i++) argv[i] = wasm_value(ctx, ft->types[ft->numRets + i], &args[i]);
+  JSValue r = JS_Call(ctx, imp->fn, JS_UNDEFINED, n, argv);
+  for (int i = 0; i < n; i++) JS_FreeValue(ctx, argv[i]);
+  if (JS_IsException(r)) {
+    if (!JS_IsUndefined(c->wasm_exc)) JS_FreeValue(ctx, c->wasm_exc);
+    c->wasm_exc = JS_GetException(ctx);
+    return "[trap] a JavaScript import threw";
+  }
+  int bad = ft->numRets ? wasm_slot(ctx, ft->types[0], r, _sp) : 0;
+  JS_FreeValue(ctx, r);
+  if (bad) {
+    if (!JS_IsUndefined(c->wasm_exc)) JS_FreeValue(ctx, c->wasm_exc);
+    c->wasm_exc = JS_GetException(ctx);
+    return "[trap] a JavaScript import returned a value of the wrong type";
+  }
+  return m3Err_none;
+}
+
+static struct cell *cell_of_ctx(JSContext *ctx) {
+  struct cell *c = JS_GetContextOpaque(ctx);
+  return c && c->db ? c : NULL;
+}
+
+static JSValue wasm_bytes_arg(JSContext *ctx, JSValueConst v, uint8_t **out, size_t *len) {
+  *out = bytes_copy(ctx, v, len);
+  return *out ? JS_UNDEFINED : JS_EXCEPTION;
+}
+
+static JSValue js_wasm_validate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  struct cell *c = cell_of_ctx(ctx);
+  if (!c || argc < 1) return JS_ThrowTypeError(ctx, "WebAssembly is not available here");
+  uint8_t *bytes; size_t len;
+  if (JS_IsException(wasm_bytes_arg(ctx, argv[0], &bytes, &len))) return JS_EXCEPTION;
+  if (!c->wenv) c->wenv = m3_NewEnvironment();
+  IM3Module m = NULL;
+  M3Result res = c->wenv ? m3_ParseModule(c->wenv, &m, bytes, (uint32_t)len) : "no environment";
+  if (!res && m) m3_FreeModule(m);
+  free(bytes);
+  return JS_NewBool(ctx, res == m3Err_none);
+}
+
+/* __celld_wasm_instantiate(bytes, resolve(module, name) -> function | undefined)
+   -> { id, exports: [[name, argc]...], memory } */
+static JSValue js_wasm_instantiate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  struct cell *c = cell_of_ctx(ctx);
+  if (!c || argc < 2) return JS_ThrowTypeError(ctx, "WebAssembly is not available here");
+  if (c->nwasm >= 16) return JS_ThrowRangeError(ctx, "a cell holds at most 16 WebAssembly instances");
+  if (!c->wenv && !(c->wenv = m3_NewEnvironment())) return JS_ThrowTypeError(ctx, "cannot create a WebAssembly environment");
+  struct winst *w = calloc(1, sizeof *w);
+  if (!w) return JS_ThrowOutOfMemory(ctx);
+  w->buf = JS_UNDEFINED;
+  size_t len;
+  if (JS_IsException(wasm_bytes_arg(ctx, argv[0], &w->bytes, &len))) { free(w); return JS_EXCEPTION; }
+  IM3Module m = NULL;
+  M3Result res = m3_ParseModule(c->wenv, &m, w->bytes, (uint32_t)len);
+  if (res) { free(w->bytes); free(w); return JS_ThrowTypeError(ctx, "invalid module: %s", res); }
+  w->rt = m3_NewRuntime(c->wenv, 64 * 1024, NULL);
+  if (!w->rt) { m3_FreeModule(m); free(w->bytes); free(w); return JS_ThrowOutOfMemory(ctx); }
+  w->rt->memoryLimit = WASM_MEMORY_LIMIT;
+  res = m3_LoadModule(w->rt, m);
+  if (res) { m3_FreeModule(m); m3_FreeRuntime(w->rt); free(w->bytes); free(w); return JS_ThrowTypeError(ctx, "cannot load module: %s", res); }
+  /* imports: only functions, resolved through the JS callback */
+  w->imports = calloc(m->numFuncImports ? m->numFuncImports : 1, sizeof(struct wimport));
+  for (u32 i = 0; i < m->numFuncImports; i++) {
+    M3Function *f = &m->functions[i];
+    JSValue a[2] = { JS_NewString(ctx, f->import.moduleUtf8 ? f->import.moduleUtf8 : ""), JS_NewString(ctx, f->import.fieldUtf8 ? f->import.fieldUtf8 : "") };
+    JSValue fn = JS_Call(ctx, argv[1], JS_UNDEFINED, 2, a);
+    JS_FreeValue(ctx, a[0]); JS_FreeValue(ctx, a[1]);
+    if (JS_IsException(fn) || !JS_IsFunction(ctx, fn)) {
+      JS_FreeValue(ctx, fn);
+      JS_FreeValue(ctx, JS_GetException(ctx));
+      char msg[256];
+      snprintf(msg, sizeof msg, "import %s.%s is not a function", f->import.moduleUtf8 ? f->import.moduleUtf8 : "?", f->import.fieldUtf8 ? f->import.fieldUtf8 : "?");
+      w->nimports = (int)i;
+      c->wasm[c->nwasm++] = w; /* freed with the cell */
+      return JS_ThrowTypeError(ctx, "%s", msg);
+    }
+    IM3FuncType ft = f->funcType;
+    char sig[40];
+    int k = 0;
+    static const char code[] = { 'v', 'i', 'I', 'f', 'F' };
+    sig[k++] = ft->numRets ? code[ft->types[0] < 5 ? ft->types[0] : 0] : 'v';
+    sig[k++] = '(';
+    for (u16 j = 0; j < ft->numArgs && k < 36; j++) { u8 t = ft->types[ft->numRets + j]; sig[k++] = code[t < 5 ? t : 0]; }
+    sig[k++] = ')';
+    sig[k] = 0;
+    w->imports[i] = (struct wimport){ c, fn, ft };
+    w->nimports = (int)i + 1;
+    res = m3_LinkRawFunctionEx(m, f->import.moduleUtf8, f->import.fieldUtf8, sig, wasm_import_trampoline, &w->imports[i]);
+    if (res && res != m3Err_functionLookupFailed) { c->wasm[c->nwasm++] = w; return JS_ThrowTypeError(ctx, "cannot link import: %s", res); }
+  }
+  c->wasm[c->nwasm++] = w;
+  int id = c->nwasm - 1;
+  wasm_budget = WASM_BUDGET;
+  wasm_depth++;
+  res = m3_RunStart(m);
+  wasm_depth--;
+  if (res) {
+    if (!JS_IsUndefined(c->wasm_exc)) { JSValue e = c->wasm_exc; c->wasm_exc = JS_UNDEFINED; return JS_Throw(ctx, e); }
+    return JS_ThrowTypeError(ctx, "start function trapped: %s", res);
+  }
+  JSValue out = JS_NewObject(ctx);
+  JSValue exports = JS_NewArray(ctx);
+  uint32_t n = 0;
+  for (u32 i = m->numFuncImports; i < m->numFunctions; i++) {
+    M3Function *f = &m->functions[i];
+    for (u16 j = 0; j < f->numNames; j++) {
+      if (!f->names[j]) continue;
+      JSValue e = JS_NewArray(ctx);
+      JS_SetPropertyUint32(ctx, e, 0, JS_NewString(ctx, f->names[j]));
+      JS_SetPropertyUint32(ctx, e, 1, JS_NewInt32(ctx, f->funcType ? f->funcType->numArgs : 0));
+      JS_SetPropertyUint32(ctx, exports, n++, e);
+    }
+  }
+  uint32_t mlen = 0;
+  uint8_t *mem = m3_GetMemory(w->rt, &mlen, 0);
+  JS_SetPropertyStr(ctx, out, "id", JS_NewInt32(ctx, id));
+  JS_SetPropertyStr(ctx, out, "exports", exports);
+  JS_SetPropertyStr(ctx, out, "memory", JS_NewBool(ctx, mem != NULL));
+  return out;
+}
+
+static struct winst *wasm_inst(JSContext *ctx, struct cell *c, JSValueConst idv) {
+  int32_t id;
+  if (!c || JS_ToInt32(ctx, &id, idv) || id < 0 || id >= c->nwasm || !c->wasm[id]->rt) return NULL;
+  return c->wasm[id];
+}
+
+/* __celld_wasm_call(id, name, args) */
+static JSValue js_wasm_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  struct cell *c = cell_of_ctx(ctx);
+  struct winst *w = argc >= 3 ? wasm_inst(ctx, c, argv[0]) : NULL;
+  if (!w) return JS_ThrowTypeError(ctx, "no such WebAssembly instance");
+  const char *name = JS_ToCString(ctx, argv[1]);
+  if (!name) return JS_EXCEPTION;
+  IM3Function f = NULL;
+  M3Result res = m3_FindFunction(&f, w->rt, name);
+  JS_FreeCString(ctx, name);
+  if (res || !f) return JS_ThrowTypeError(ctx, "no such export");
+  IM3FuncType ft = f->funcType;
+  uint64_t slots[16] = { 0 }, rets[4] = { 0 };
+  const void *aptrs[16], *rptrs[4];
+  int n = ft->numArgs > 16 ? 16 : ft->numArgs;
+  for (int i = 0; i < n; i++) {
+    JSValue v = JS_GetPropertyUint32(ctx, argv[2], (uint32_t)i);
+    int bad = wasm_slot(ctx, ft->types[ft->numRets + i], v, &slots[i]);
+    JS_FreeValue(ctx, v);
+    if (bad) return JS_EXCEPTION;
+    aptrs[i] = &slots[i];
+  }
+  if (wasm_depth == 0) wasm_budget = WASM_BUDGET;
+  wasm_depth++;
+  res = m3_Call(f, (uint32_t)n, aptrs);
+  wasm_depth--;
+  wasm_check_all(c); /* back in JS: no stale memory views */
+  if (res) {
+    if (!JS_IsUndefined(c->wasm_exc)) { JSValue e = c->wasm_exc; c->wasm_exc = JS_UNDEFINED; return JS_Throw(ctx, e); }
+    return JS_ThrowTypeError(ctx, "RuntimeError: %s", res);
+  }
+  int nr = ft->numRets > 4 ? 4 : ft->numRets;
+  if (nr == 0) return JS_UNDEFINED;
+  for (int i = 0; i < nr; i++) rptrs[i] = &rets[i];
+  if (m3_GetResults(f, (uint32_t)nr, rptrs)) return JS_ThrowTypeError(ctx, "cannot read results");
+  return wasm_value(ctx, ft->types[0], &rets[0]);
+}
+
+static JSValue js_wasm_memory(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  struct cell *c = cell_of_ctx(ctx);
+  struct winst *w = argc >= 1 ? wasm_inst(ctx, c, argv[0]) : NULL;
+  if (!w) return JS_ThrowTypeError(ctx, "no such WebAssembly instance");
+  wasm_check_memory(c, w);
+  if (JS_IsUndefined(w->buf)) {
+    uint32_t len = 0;
+    uint8_t *p = m3_GetMemory(w->rt, &len, 0);
+    if (!p) return JS_UNDEFINED;
+    w->buf = JS_NewArrayBuffer(ctx, p, len, no_free, NULL, 0);
+    w->buf_ptr = p;
+    w->buf_len = len;
+  }
+  return JS_DupValue(ctx, w->buf);
+}
+
+static JSValue js_wasm_grow(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  struct cell *c = cell_of_ctx(ctx);
+  struct winst *w = argc >= 2 ? wasm_inst(ctx, c, argv[0]) : NULL;
+  int32_t delta;
+  if (!w || JS_ToInt32(ctx, &delta, argv[1]) || delta < 0) return JS_ThrowTypeError(ctx, "bad grow");
+  uint32_t len = 0;
+  m3_GetMemory(w->rt, &len, 0);
+  uint32_t pages = len / 65536;
+  M3Result res = ResizeMemory(w->rt, pages + (uint32_t)delta);
+  wasm_check_memory(c, w);
+  if (res) return JS_ThrowRangeError(ctx, "cannot grow memory: %s", res);
+  return JS_NewInt32(ctx, (int32_t)pages);
+}
+
+/* Bytes of WebAssembly memory a cell holds, for memory accounting. */
+static size_t wasm_memory_bytes(struct cell *c) {
+  size_t total = 0;
+  for (int i = 0; i < c->nwasm; i++) { uint32_t len = 0; if (c->wasm[i]->rt && m3_GetMemory(c->wasm[i]->rt, &len, 0)) total += len; }
+  return total;
+}
+
 static JSValue js_digest(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)t; return js_hash(ctx, argc, argv, 0); }
 static JSValue js_hmac(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)t; return js_hash(ctx, argc, argv, 1); }
 
@@ -362,6 +728,7 @@ CAMLprim value celld_js_create(value prelude, value script, value conn) {
   struct cell *c = calloc(1, sizeof *c);
   if (!c) caml_raise_out_of_memory();
   c->pending = JS_UNDEFINED;
+  c->wasm_exc = JS_UNDEFINED;
   c->db = celld_sql_handle(conn);
   c->rt = JS_NewRuntime2(&counted_malloc, NULL);
   if (!c->rt) { free(c); CAMLreturn(error_of(NULL)); }
@@ -378,6 +745,12 @@ CAMLprim value celld_js_create(value prelude, value script, value conn) {
   JS_SetPropertyStr(c->ctx, g, "__celld_random", JS_NewCFunction(c->ctx, js_random, "__celld_random", 1));
   JS_SetPropertyStr(c->ctx, g, "__celld_digest", JS_NewCFunction(c->ctx, js_digest, "__celld_digest", 2));
   JS_SetPropertyStr(c->ctx, g, "__celld_hmac", JS_NewCFunction(c->ctx, js_hmac, "__celld_hmac", 3));
+  JS_SetPropertyStr(c->ctx, g, "__celld_crypto", JS_NewCFunction(c->ctx, js_crypto, "__celld_crypto", 5));
+  JS_SetPropertyStr(c->ctx, g, "__celld_wasm_validate", JS_NewCFunction(c->ctx, js_wasm_validate, "__celld_wasm_validate", 1));
+  JS_SetPropertyStr(c->ctx, g, "__celld_wasm_instantiate", JS_NewCFunction(c->ctx, js_wasm_instantiate, "__celld_wasm_instantiate", 2));
+  JS_SetPropertyStr(c->ctx, g, "__celld_wasm_call", JS_NewCFunction(c->ctx, js_wasm_call, "__celld_wasm_call", 3));
+  JS_SetPropertyStr(c->ctx, g, "__celld_wasm_memory", JS_NewCFunction(c->ctx, js_wasm_memory, "__celld_wasm_memory", 1));
+  JS_SetPropertyStr(c->ctx, g, "__celld_wasm_grow", JS_NewCFunction(c->ctx, js_wasm_grow, "__celld_wasm_grow", 2));
   JS_FreeValue(c->ctx, g);
   if (!eval(c, prelude, "prelude.js") || !eval(c, script, "class.js")) {
     char *msg = exception_text(c->ctx);
@@ -550,5 +923,50 @@ CAMLprim value celld_js_memory(value cv) {
   if (!c || !c->rt) return Val_long(0);
   JSMemoryUsage u;
   JS_ComputeMemoryUsage(c->rt, &u);
-  return Val_long(u.malloc_size);
+  return Val_long(u.malloc_size + wasm_memory_bytes(c));
+}
+
+/* invoke(cell, fn, arg) -> Ok string | Error message: call the global
+   function [fn] with one string, run every job it queues, and return the
+   string it returned. The event loop (__celld_start, __celld_resume,
+   __celld_poll) runs on this. */
+CAMLprim value celld_js_invoke(value cv, value fn_name, value arg) {
+  CAMLparam3(cv, fn_name, arg);
+  CAMLlocal1(r);
+  struct cell *c = Cell_val(cv);
+  if (!c) caml_failwith("js: cell disposed");
+  if (c->poisoned) {
+    static const char msg[] = "poisoned: earlier promise jobs never finished";
+    char *m = malloc(sizeof msg);
+    if (m) memcpy(m, msg, sizeof msg);
+    CAMLreturn(error_of(m));
+  }
+  JSContext *ctx = c->ctx;
+  enter(c);
+  JSValue g = JS_GetGlobalObject(ctx);
+  JSValue fn = JS_GetPropertyStr(ctx, g, String_val(fn_name));
+  JSValue a = JS_NewStringLen(ctx, String_val(arg), caml_string_length(arg));
+  JSValue rv = JS_Call(ctx, fn, g, 1, &a);
+  JS_FreeValue(ctx, a);
+  JS_FreeValue(ctx, fn);
+  JS_FreeValue(ctx, g);
+  c->budget = CALL_BUDGET;
+  JSContext *failed = NULL;
+  if (JS_IsException(rv)) {
+    char *msg = exception_text(ctx);
+    drain(c, &failed);
+    CAMLreturn(error_of(msg));
+  }
+  /* a job that throws is an unhandled rejection: it belongs to its call,
+     which sees it as that call's error, not to the loop */
+  drain(c, &failed);
+  if (failed) JS_FreeValue(failed, JS_GetException(failed));
+  size_t n;
+  const char *s = JS_ToCStringLen(ctx, &n, rv);
+  JS_FreeValue(ctx, rv);
+  if (!s) CAMLreturn(error_of(exception_text(ctx)));
+  r = caml_alloc(1, 0);
+  Store_field(r, 0, caml_alloc_initialized_string(n, s));
+  JS_FreeCString(ctx, s);
+  CAMLreturn(r);
 }

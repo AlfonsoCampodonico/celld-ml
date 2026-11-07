@@ -177,14 +177,25 @@ claim its cells.
   `alarm(ctx)`, and may return a `Response`, a string, a JSON value or a
   promise. `ctx.storage.sql.exec(query, ...bindings)` runs SQL on the cell's
   SQLite database. `ctx.storage.get/put/delete/list` are a KV on top of it.
-  Each call runs in a savepoint, so a handler that throws leaves no writes.
-  Every call has an instruction budget and the runtime has a memory limit,
-  so a runaway script fails without stalling the node.
+  Every call has an instruction budget and each cell's runtime has its own
+  memory limit, so a runaway script fails without stalling the node.
   [examples/chat.js](examples/chat.js) is a chat room.
-- **Workers APIs, with I/O.** QuickJS cannot block, so a call that awaits
-  I/O suspends with a list of operations. The node performs them and
-  resumes the call, and one savepoint covers the call across every wait.
-  On top of that, each with a 30 s deadline and at most 50 per call:
+- **Interleaving, as in celld.** QuickJS cannot block, so every JS context
+  runs on an event loop in the node. Calls start, run until they await,
+  and hand the node a list of operations. The node performs those
+  concurrently and resumes the context with each result as it arrives. A
+  second event runs while the first awaits, and synchronous code is never
+  interrupted. Writes apply as they happen, as in celld and Cloudflare, so
+  a handler that throws keeps what it already wrote.
+  `ctx.storage.transactionSync(fn)` and `ctx.storage.transaction(async fn)`
+  make a group of writes atomic, and an async transaction holds the input
+  gate so no other event starts meanwhile. Each loop step is committed, and
+  a call is released only once everything written before it finished is
+  durable. The runtime-driven cells (`__cron`, `__consumer`, `wf-`) run one
+  event at a time instead, with rollback, because their retry logic needs
+  it.
+- **Workers APIs, with I/O.** Every operation has a 30 s deadline, with up
+  to 200 in flight per context:
   - **Outbound fetch.** `fetch()` uses `Request`, `Response` and `Headers`
     with binary bodies. TLS is checked against the Mozilla root store.
     Hostnames resolve through a built-in DNS client (`--dns`). Cells can
@@ -201,20 +212,53 @@ claim its cells.
     `step.do(name, [config], fn)` is memoized, and a failed step rolls back
     its writes and retries with backoff. `step.sleep` and
     `step.sleepUntil` suspend the run until its alarm.
-  - **The rest:** timers (`setTimeout`, `setInterval`), `ctx.waitUntil`
-    (finished before the response leaves), `crypto.getRandomValues`,
-    `randomUUID`, `subtle.digest` and HMAC
-    `importKey`/`generateKey`/`sign`/`verify` (from the node's CSPRNG and
-    digestif), `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`,
-    `atob`, `btoa`, `console`, `structuredClone`, `queueMicrotask` and a
-    minimal `ReadableStream`.
+  - **Service bindings.** `ctx.service(Class).fetch(...)` runs another
+    class as a stateless Worker on the same node.
+  - **Cache API.** `caches.default` and `caches.open(name)` give
+    `match/put/delete` in a node-local, size-bounded cache that honors
+    `max-age`, `s-maxage`, `no-store` and `private`.
+  - **Web Crypto.** `getRandomValues` and `randomUUID` (the node's CSPRNG),
+    `digest` (SHA-1/256/384/512), HMAC, AES-GCM, ECDSA and ECDH on P-256,
+    with raw and JWK keys (digestif and mirage-crypto).
+  - **WebAssembly.** See below.
+  - **Streams.** `ReadableStream` (pull and push sources, readers, async
+    iteration, `pipeTo`, `pipeThrough`, `tee`), `WritableStream`,
+    `TransformStream`, `TextEncoderStream` and `TextDecoderStream`.
+  - **HTMLRewriter.** Cloudflare's API (element, text, comment and document
+    handlers; attribute changes; `before/after/prepend/append`,
+    `setInnerContent`, `replace`, `remove`, `removeAndKeepContent`,
+    `onEndTag`). Selectors cover tags, `*`, `.class`, `#id`, attribute
+    operators, compounds, and descendant and child combinators.
+  - **Node.js subset.** `Buffer`, `process`, and `require` of `buffer`,
+    `events`, `path`, `util`, `assert`, `url`, `crypto` (`createHash`,
+    `createHmac`, `randomBytes`, `timingSafeEqual`), `timers`, `stream` and
+    `string_decoder`, with or without `node:`.
+  - **The rest.** Timers, `ctx.waitUntil` (it keeps running after the
+    response), `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`,
+    `atob`, `btoa`, `console`, `structuredClone` and `queueMicrotask`.
 
-  [examples/workers.js](examples/workers.js) tours all of it.
+  [examples/workers.js](examples/workers.js) and
+  [examples/edge.js](examples/edge.js) tour all of it.
+- **Stateless Workers.** `/w/<Class>/<path>` runs a class's `fetch` on
+  whichever node received the request, with no cell, no ownership and no
+  storage. It uses one context per class per node on an event loop, and
+  can still use fetch, cell stubs, D1, R2, queues (sent directly), the
+  cache and service bindings.
+- **WebAssembly.** wasm3, an interpreter written in C, is fetched with the
+  other engines and runs where a JIT cannot. `WebAssembly.validate`,
+  `compile`, `instantiate`, `Module` and `Instance` support function
+  imports from JS and exported functions (i32, i64 as BigInt, f32, f64).
+  An exported `memory` has a live `buffer` and `grow`. The vendored wasm3
+  is patched (marked "celld-ml") to yield on loop back-edges as well as
+  calls, so an instruction budget stops a runaway module with a
+  `RuntimeError`. Memory is capped at 64 MiB per instance and 16 instances
+  per cell. When memory moves, the old `buffer` is detached rather than
+  left dangling.
 - **Rolling deploys.** Each resident JS cell records which deployment (the
   script's etag) it runs. A deploy is announced to the peers, and every
   node also rechecks the classes of its resident cells. A cell switches to
-  new code before its next event. Calls are serial, so none is in flight
-  then, and the cell keeps its epoch, storage and WebSockets. `/state`
+  new code at the next moment no call is in flight, and keeps its epoch,
+  storage and WebSockets. Stateless Workers reload the same way. `/state`
   shows each cell's deployment.
 - **Memory-pressure and residency shedding.** With `--max-memory-mb` (cell
   memory: the OCaml heap, SQLite pages and per-cell JS heaps) or
@@ -287,12 +331,38 @@ claim its cells.
   bucket stays the root of trust. The protocol version is 6, so nodes
   without peer TLS are not recruited.
 
-Compared with celld, celld-ml lacks the Node.js compatibility layer,
-WebAssembly, HTMLRewriter, the Cache API, Web Crypto beyond random
-values, digests and HMAC, streams beyond a minimal `ReadableStream`, and
-service bindings between Workers (cells reach each other through
-`ctx.cell`). A cell also runs one event at a time, even across awaits;
-celld interleaves at awaits.
+## Missing compared with celld
+
+celld-ml follows celld's design, and much of its runtime surface is
+partial. Known gaps:
+
+- **Programming model.** Class scripts are plain scripts with global
+  handlers. There are no ES modules (`export default`), no Wrangler project
+  or `celld deploy` CLI, and no `env` bindings object: everything goes
+  through `ctx`.
+- **Workers platform services.** Workers KV namespaces, TCP sockets
+  (`connect()`), email, AI, Vectorize, Hyperdrive and Analytics Engine are
+  not available.
+- **Node.js.** Only the subset above. There is no `fs`, `net`, `http`,
+  `child_process` or `worker_threads`, and no Node-style streams.
+- **Web Crypto.** No RSA, AES-CBC/CTR/KW, PBKDF2, HKDF, Ed25519 or X25519.
+  Elliptic curves are P-256 only.
+- **Streams.** No byte (BYOB) readers, real backpressure or queuing
+  strategies.
+- **HTMLRewriter.** It buffers the whole body instead of streaming, and
+  pseudo-classes such as `:nth-child` and `:not` are unsupported.
+- **WebAssembly.** It is interpreted, so slow next to V8. Imports are
+  functions only (no imported memory, tables or globals). There are no
+  `WebAssembly.Memory`, `Table` or `Global` constructors and no multi-value
+  results.
+- **Deploys.** A busy cell keeps its old code until it is idle. There is no
+  forced move after a maximum age, and two versions never run side by
+  side.
+- **Operations.** There are no telemetry or metrics endpoints and no
+  autoscaler load block (RSS, CPU, file descriptors), and no
+  `POST /rebalance/pause`, no `/shutdown?handoff=preserve` and no placement
+  weights. Paged cells that hydrate lazily from the bucket are absent:
+  restore always reads a cell's whole chain. The public port has no TLS.
 
 ## Layout
 
@@ -304,7 +374,7 @@ celld interleaves at awaits.
 | `lib/ws` | WebSocket handshake and frames (RFC 6455), checked against the RFC's examples |
 | `lib/cron` | Cloudflare-dialect cron expressions: parsing, next occurrence, catch-up |
 | `lib/s3` | SigV4 signing (checked against AWS's published examples), key encoding, ListObjectsV2 parsing |
-| `lib/js` | the JS cell runtime over QuickJS 2026-06-04 (fetched by `scripts/fetch-vendor.sh`): the Solo5 shims it needs, prelude, storage binding, budgets |
+| `lib/js` | the JS runtime over QuickJS 2026-06-04 and wasm3 0.5.0 (both fetched by `scripts/fetch-vendor.sh`): the Solo5 shims they need, the Workers prelude, Node subset, HTMLRewriter, Web Crypto natives, the WebAssembly bridge, budgets |
 | `lib/sqlite` | SQLite 3.54.1 (fetched by `scripts/fetch-vendor.sh`), an in-memory VFS with dirty-page tracking, limits, and the OCaml binding |
 | `lib/wire` | JSON records, the `CLA1` log batch, and peer signing helpers |
 | `lib/http`, `lib/http/mirage`, `lib/bucketc` | HTTP/1.1, plus server and client over mirage-tcpip, plus the bucket client |
@@ -398,6 +468,19 @@ dune build @runtest --root . --build-dir _build_all
 - **Peer TLS:** a packet capture of a forwarded write showed 358 packets
   of TLS records on port 8081 and none of the request's plaintext, and a
   takeover recovered the dead owner's log over TLS.
+- **Interleaving, Workers and WebAssembly:** with a 2-second request
+  waiting on a cell, a second request to the same cell through another
+  node finished in 17 ms.
+  - A handler that threw kept its earlier write, while `transactionSync`
+    rolled back.
+  - A cache put was a hit on the next request.
+  - The edge class served the same `fetch` as a stateless Worker over
+    `/w/Edge` and through a cell's service binding, and refused storage
+    there.
+  - HTMLRewriter rewrote links.
+  - A WebAssembly module added, called its JS import, exposed its data
+    segment and had its infinite loop stopped with a `RuntimeError`, in a
+    cell and in a Worker. The node kept serving.
 - **Workers APIs:** with dnsmasq and a small HTTP server on the bridge,
   these all worked across three nodes: a cell fetched `upstream.test`, was
   refused the bucket, and computed SHA-256 and a UUID. It also ran D1

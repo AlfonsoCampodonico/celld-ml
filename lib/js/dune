@@ -1,8 +1,9 @@
-; QuickJS (MIT, Fabrice Bellard and Charlie Gordon; vendored release
-; 2026-06-04, engine only) and the JS cell runtime binding.
+; QuickJS (MIT, Fabrice Bellard and Charlie Gordon; release 2026-06-04,
+; engine only), wasm3 (MIT, Steven Massey and Volodymyr Shymanskyy; 0.5.0),
+; both fetched by scripts/fetch-vendor.sh, and the JS cell runtime binding.
 (library
  (name celld_js)
- (libraries celld_sqlite digestif)
+ (libraries celld_sqlite digestif mirage-crypto mirage-crypto-ec)
  (foreign_stubs
   (language c)
   (names
@@ -11,11 +12,26 @@
    celld_qjs_libunicode
    celld_qjs_cutils
    celld_qjs_dtoa
+   celld_m3_bind
+   celld_m3_code
+   celld_m3_compile
+   celld_m3_core
+   celld_m3_emit
+   celld_m3_env
+   celld_m3_exec
+   celld_m3_function
+   celld_m3_info
+   celld_m3_module
+   celld_m3_optimize
+   celld_m3_parse
    celld_js_stubs)
-  (include_dirs compat quickjs ../sqlite)
+  (include_dirs compat quickjs wasm3 ../sqlite)
   (extra_deps
    celld_qjs_prefix.h
+   celld_m3_prefix.h
    compat/fenv.h
+   (glob_files wasm3/*.c)
+   (glob_files wasm3/*.h)
    (glob_files quickjs/*.c)
    (glob_files quickjs/*.h))
   (flags

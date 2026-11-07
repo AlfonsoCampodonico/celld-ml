@@ -13,6 +13,6 @@ jobs:
       - uses: ocaml/setup-ocaml@v3
         with:
           ocaml-compiler: "5.3"
-      - run: opam install -y dune digestif
+      - run: opam install -y dune digestif mirage-crypto mirage-crypto-ec mirage-crypto-rng
       - run: scripts/fetch-vendor.sh
       - run: opam exec -- dune build @runtest --root .

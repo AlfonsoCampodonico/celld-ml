@@ -17,3 +17,5 @@ lib/sqlite/sqlite3.c
 lib/sqlite/sqlite3.h
 lib/js/quickjs/
 *.hvt.debug
+
+lib/js/wasm3/

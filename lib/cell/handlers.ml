@@ -604,3 +604,48 @@ let js (rt : Celld_js.t) cell : async_handler =
         js_call s rt ~strict:false ~name:"fetch" ~cell ~meth ~path ~query ~body (function
           | Ok r -> Done (reply_of_js s r)
           | Error r -> Done (err 500 ("uncaught exception: " ^ r.body ^ "\n")))
+
+
+(* ---- JS cells on the event loop ----
+   Regular JS cells run on the node's event loop: calls interleave whenever
+   one awaits, and writes apply as they happen (ctx.storage.transactionSync
+   and transaction group them). This maps a request to either an immediate
+   reply or a JS call and how to turn its output into a reply. The
+   runtime-driven cells (cron, queue consumers, workflows) keep [js]. *)
+
+type js_route =
+  | Reply_now of reply
+  | Call of { name : string; body : string; finish : (Celld_js.response, string) result -> reply }
+
+let is_strict_js_cell cell = is_cron_cell cell || is_wf_cell cell || String.ends_with ~suffix:":__consumer" cell
+
+let js_loop_route s ~now_ms ~meth ~path ~query ~body =
+  let plain _ ~meth:_ ~path:_ ~query:_ ~body:_ = err 404 "" in
+  match meth, path with
+  | ("GET" | "PUT" | "DELETE"), "/__alarm" -> Reply_now (with_alarm (fun _ ~now_ms:_ -> ()) plain s ~now_ms ~meth ~path ~query ~body)
+  | "ALARM", "/__alarm/fire" -> (
+      match alarm_of s with
+      | Some at when at <= now_ms ->
+          Store.meta_remove s "alarm";
+          Call { name = "alarm"; body = ""; finish = (fun _ -> ok "fired\n") }
+      | _ -> Reply_now (ok "not due\n"))
+  | "OUTBOX", "/__outbox/ack" -> Reply_now (with_outbox (fun _ ~now_ms:_ ~meth:_ ~path:_ ~query:_ ~body:_ -> err 404 "") s ~now_ms ~meth ~path ~query ~body)
+  | "WS", "/__ws/touch" -> Reply_now (ok "ok\n")
+  | "WS", (("/__ws/message" | "/__ws/close") as p) ->
+      Call
+        {
+          name = (if p = "/__ws/message" then "ws_message" else "ws_close");
+          body;
+          finish = (function Ok _ -> ok "" | Error e -> err 500 ("uncaught exception: " ^ e ^ "\n"));
+        }
+  | m, _ when String.length m > 0 && not (List.mem m [ "GET"; "HEAD"; "POST"; "PUT"; "PATCH"; "DELETE"; "OPTIONS" ]) -> Reply_now (err 405 "not a JS cell event\n")
+  | _ ->
+      Call
+        {
+          name = "fetch";
+          body;
+          finish =
+            (function
+            | Ok r -> { status = r.status; body = r.body; wrote = false; content_type = Celld_js.content_type r; effects = "" }
+            | Error e -> err 500 ("uncaught exception: " ^ e ^ "\n"));
+        }

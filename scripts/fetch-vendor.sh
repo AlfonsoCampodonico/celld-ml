@@ -12,6 +12,9 @@ SQLITE_SHA3_256=92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30
 QUICKJS_URL=https://bellard.org/quickjs/quickjs-2026-06-04.tar.xz
 QUICKJS_SHA256=b376e839b322978313d929fd20663b11ba58b75df5a46c126dd19ea2fa70ad2a    # as first fetched
 
+WASM3_URL=https://github.com/wasm3/wasm3/archive/refs/tags/v0.5.0.tar.gz
+WASM3_SHA256=b778dd72ee2251f4fe9e2666ee3fe1c26f06f517c3ffce572416db067546536c    # as first fetched
+
 check() { # file algorithm expected
   local got
   got=$(python3 -c "import hashlib,sys; print(hashlib.new(sys.argv[2], open(sys.argv[1],'rb').read()).hexdigest())" "$1" "$2")
@@ -50,4 +53,27 @@ assert s.count(old) == 1, "QuickJS patch no longer applies"
 open(p, "w").write(s.replace(old, new))
 PY
   echo "fetched QuickJS 2026-06-04"
+fi
+
+if [ ! -f "$root/lib/js/wasm3/m3_core.c" ]; then
+  curl -fsSL -o "$tmp/wasm3.tar.gz" "$WASM3_URL"
+  check "$tmp/wasm3.tar.gz" sha256 "$WASM3_SHA256"
+  (cd "$tmp" && tar xzf wasm3.tar.gz)
+  mkdir -p "$root/lib/js/wasm3"
+  cp "$tmp"/wasm3-0.5.0/source/m3_*.c "$tmp"/wasm3-0.5.0/source/m3_*.h "$tmp"/wasm3-0.5.0/source/wasm3*.h "$tmp"/wasm3-0.5.0/LICENSE "$root/lib/js/wasm3/"
+  rm -f "$root"/lib/js/wasm3/m3_api_*.c
+  # Loop back-edges call m3_Yield too, not only calls, so the node's
+  # instruction budget can stop a tight loop.
+  python3 - "$root/lib/js/wasm3/m3_exec.h" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+y = "    { m3ret_t possible_trap = m3_Yield (); if (UNLIKELY(possible_trap)) return possible_trap; } /* celld-ml */\n"
+a = "d_m3Op  (ContinueLoop)\n{\n    m3StackCheck();\n"
+b = "    if (condition)\n    {\n        return loopId;\n    }"
+assert s.count(a) == 1 and s.count(b) == 1, "wasm3 patch no longer applies"
+s = s.replace(a, a + y).replace(b, "    if (condition)\n    {\n" + y + "        return loopId;\n    }")
+open(p, "w").write(s)
+PY
+  echo "fetched wasm3 0.5.0"
 fi

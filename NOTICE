@@ -17,5 +17,12 @@ It also downloads the QuickJS engine, release 2026-06-04
 (https://bellard.org/quickjs), Copyright (c) 2017-2021 Fabrice Bellard and
 Charlie Gordon, under the MIT License, into lib/js/quickjs (its LICENSE
 comes with it), and modifies one line of quickjs.c, marked "celld-ml", so
-Atomics can be turned off with CELLD_NO_ATOMICS. Built unikernels contain
-both, so distributing them carries these notices.
+Atomics can be turned off with CELLD_NO_ATOMICS.
+
+It also downloads wasm3 0.5.0 (https://github.com/wasm3/wasm3), Copyright
+(c) 2019 Steven Massey and Volodymyr Shymanskyy, under the MIT License,
+into lib/js/wasm3 (its LICENSE comes with it), and modifies two places in
+m3_exec.h, marked "celld-ml", so loop back-edges call m3_Yield.
+
+Built unikernels contain all three, so distributing them carries these
+notices.
