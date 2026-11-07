@@ -26,6 +26,7 @@ type cell = {
   mutable active : int;
   mutable last_used_ms : int;
   mutable barriers : op list;  (** open write barriers, newest first *)
+  mutable moving_to : peer option;  (** shed: hand off to this peer once quiet *)
 }
 
 type barrier = {
@@ -43,6 +44,7 @@ type authority =
   | Recovering_own of { op : op; prior : lease }
   | Writing of { op : op; lease : lease; held : lease option }
   | Held of lease
+  | Retiring of { op : op; lease : lease }  (** writing the final, expired lease after a drain *)
   | Fenced
 
 type t = {
@@ -55,6 +57,10 @@ type t = {
   mutable authority : authority;
   mutable lease_gen : int;
   mutable want_followers : peer list;
+  mutable draining : bool;
+  mutable drain_targets : peer list;
+  mutable drain_next : int;
+  mutable drain_check : op option;
   cells : (cell_id, cell) Hashtbl.t;
   requests : (req, cell_id) Hashtbl.t;  (** local requests awaiting [Output_at] *)
   barriers : (op, barrier) Hashtbl.t;
@@ -71,6 +77,10 @@ let create ?(config = default_config) ~node ~session ~addr () =
     authority = Unstarted;
     lease_gen = 0;
     want_followers = [];
+    draining = false;
+    drain_targets = [];
+    drain_next = 0;
+    drain_check = None;
     cells = Hashtbl.create 64;
     requests = Hashtbl.create 64;
     barriers = Hashtbl.create 64;
@@ -85,7 +95,7 @@ let cell st id =
   match Hashtbl.find_opt st.cells id with
   | Some c -> c
   | None ->
-      let c = { id; phase = Inactive; waiters = []; active = 0; last_used_ms = st.now_ms; barriers = [] } in
+      let c = { id; phase = Inactive; waiters = []; active = 0; last_used_ms = st.now_ms; barriers = []; moving_to = None } in
       Hashtbl.replace st.cells id c;
       c
 
@@ -103,6 +113,9 @@ let authority_valid st =
 
 let fenced st = st.authority = Fenced
 
+let resident_count st =
+  Hashtbl.fold (fun _ c n -> match c.phase with Resident _ | Restoring _ | Ensuring _ -> n + 1 | _ -> n) st.cells 0
+
 let new_lease st ~log ~followers =
   {
     l_node = st.node;
@@ -112,6 +125,8 @@ let new_lease st ~log ~followers =
     l_protocol = st.config.protocol;
     l_log = log;
     l_followers = followers;
+    l_cells = resident_count st;
+    l_draining = st.draining;
     l_etag = "";
   }
 
@@ -191,6 +206,10 @@ let on_lease_cas st op result =
           [ Read_self_lease { op } ]
       | Cas_failed (Definite e) -> (
           match held with Some l -> lease_held st l | None -> halt st ("cannot write node lease: " ^ e)))
+  | Retiring { op = o; _ } when o = op -> (
+      match result with
+      | Applied _ -> [ Exit_node "drained" ]
+      | _ -> halt st "cannot retire node lease")
   | _ -> []
 
 let on_own_log_recovered st op result =
@@ -235,7 +254,26 @@ let start_resolve st c =
   c.phase <- Reading_owner { op; reconciling = None };
   [ Read_owner { op; cell = c.id } ]
 
+(* Where a draining node sends what it will not own: its targets in turn. *)
+let next_drain_target st =
+  match st.drain_targets with
+  | [] -> None
+  | ts ->
+      let p = List.nth ts (st.drain_next mod List.length ts) in
+      st.drain_next <- st.drain_next + 1;
+      Some p
+
+(* Route the waiters to [peer] for a while; after that the cell resolves
+   from own.json like any other. *)
+let hand_to st c peer ~epoch =
+  c.moving_to <- None;
+  c.phase <- Remote { peer; epoch; until_ms = st.now_ms + st.config.ttl_ms };
+  complete_waiters st c
+
 let acquire st c ?(tries = 0) claim =
+  match if st.draining then next_drain_target st else None with
+  | Some peer -> hand_to st c peer ~epoch:(claim.epoch - 1)
+  | None ->
   let op = fresh_op st in
   c.phase <- Acquiring { op; claim; tries };
   [ Cas_owner { op; cell = c.id; guard = claim.guard; epoch = claim.epoch } ]
@@ -253,6 +291,11 @@ let on_request st req id =
     c.last_used_ms <- st.now_ms;
     match c.phase with
     | Resident { epoch; _ } -> [ admit st c epoch req ]
+    | Ensuring _ when c.moving_to <> None || st.draining ->
+        (* A handoff is not cancelled by traffic: the request waits and
+           follows the cell to its new owner. *)
+        c.waiters <- req :: c.waiters;
+        []
     | Ensuring { epoch; etag; _ } ->
         (* A request cancels an eviction that has not yet stopped the
            runtime. The pending [Durability_checked] no longer matches. *)
@@ -445,6 +488,22 @@ let on_verified st op result =
       | Error e -> settle st op (Error (Durability_unproven (string_of_failure e))))
   | _ -> []
 
+(* ---- draining ---- *)
+
+(* Nothing is owned, or on its way to being owned or released, here. *)
+let drain_progress_idle st =
+  Hashtbl.fold (fun _ c ok -> ok && match c.phase with Inactive | Remote _ -> c.waiters = [] | _ -> false) st.cells true
+
+(* Once every cell is gone, ask the executor whether the node log is fully
+   in the bucket; [Drain_checked] then retires the lease. *)
+let drain_progress st =
+  match st.authority with
+  | Held _ when st.draining && st.drain_check = None && drain_progress_idle st ->
+      let op = fresh_op st in
+      st.drain_check <- Some op;
+      [ Check_drained { op } ]
+  | _ -> []
+
 (* ---- eviction ---- *)
 
 let sweep st =
@@ -453,14 +512,15 @@ let sweep st =
       (fun _ c acc ->
         match c.phase with
         | Resident { epoch; etag }
-          when c.active = 0 && c.barriers = [] && st.now_ms - c.last_used_ms >= st.config.idle_ms ->
+          when c.active = 0 && c.barriers = []
+               && (st.now_ms - c.last_used_ms >= st.config.idle_ms || c.moving_to <> None || st.draining) ->
             let op = fresh_op st in
             c.phase <- Ensuring { op; epoch; etag };
             Ensure_durable { op; cell = c.id; epoch } :: acc
         | _ -> acc)
       st.cells []
   in
-  Schedule_timer { timer = Idle_sweep; generation = 0; at_ms = st.now_ms + st.config.sweep_ms } :: fx
+  Schedule_timer { timer = Idle_sweep; generation = 0; at_ms = st.now_ms + st.config.sweep_ms } :: fx @ drain_progress st
 
 let on_durability_checked st op id result =
   match Hashtbl.find_opt st.cells id with
@@ -472,7 +532,7 @@ let on_durability_checked st op id result =
           [ Stop_runtime { op; cell = id; epoch; reset = false } ]
       | _ ->
           c.phase <- Resident { epoch; etag };
-          [])
+          complete_waiters st c)
   | _ -> []
 
 let on_runtime_stopped st op id =
@@ -490,11 +550,47 @@ let on_runtime_stopped st op id =
 
 let on_owner_released st op id _result =
   match Hashtbl.find_opt st.cells id with
-  | Some ({ phase = Releasing { op = o; _ }; _ } as c) when o = op ->
+  | Some ({ phase = Releasing { op = o; epoch }; _ } as c) when o = op -> (
       (* Rejected or ambiguous both end here: the next activation re-reads. *)
       c.phase <- Inactive;
-      if c.waiters <> [] then start_resolve st c else []
+      let target = match c.moving_to with Some p -> Some p | None -> if st.draining then next_drain_target st else None in
+      match target with
+      | Some peer -> Hand_off { cell = id; peer } :: hand_to st c peer ~epoch
+      | None -> if c.waiters <> [] then start_resolve st c else [])
   | _ -> []
+
+(* ---- moving cells ---- *)
+
+let on_shed st cells (target : peer) =
+  if target.p_node <> st.node && not st.draining then
+    List.iter
+      (fun id ->
+        match Hashtbl.find_opt st.cells id with
+        | Some ({ phase = Resident _; _ } as c) -> c.moving_to <- Some target
+        | _ -> ())
+      cells;
+  []
+
+let on_drain st targets =
+  let targets = List.filter (fun p -> p.p_node <> st.node) targets in
+  let was = st.draining in
+  st.draining <- true;
+  st.drain_targets <- targets;
+  (* Publish it now, so no one recruits or targets this node. *)
+  match st.authority with Held l when not was -> renew st l | _ -> []
+
+let on_drain_checked st op result =
+  if st.drain_check <> Some op then []
+  else begin
+    st.drain_check <- None;
+    match result, st.authority with
+    | Ok (), Held l when drain_progress_idle st ->
+        let op = fresh_op st in
+        let lease = { (new_lease st ~log:Log_none ~followers:[]) with l_expires_ms = st.now_ms } in
+        st.authority <- Retiring { op; lease };
+        [ Cas_lease { op; guard = Match l.l_etag; lease } ]
+    | _ -> [] (* the next sweep asks again *)
+  end
 
 (* ---- timers ---- *)
 
@@ -530,6 +626,9 @@ let on_event st ~now_ms event =
     | Own_log_recovered { op; result } -> on_own_log_recovered st op result
     | Lease_cas_completed { op; result } -> on_lease_cas st op result
     | Followers_chosen peers -> on_followers_chosen st peers
+    | Shed { cells; target } -> on_shed st cells target
+    | Drain targets -> on_drain st targets
+    | Drain_checked { op; result } -> on_drain_checked st op result
     | Timer_fired { timer; generation } -> on_timer st timer generation
     | Request { req; cell } -> on_request st req cell
     | Invalidate_remote id -> on_invalidate_remote st id

@@ -33,6 +33,8 @@ type lease = {
   l_protocol : int;
   l_log : log_state;
   l_followers : peer list;
+  l_cells : int;  (** resident cells, for rebalancing *)
+  l_draining : bool;  (** not a follower or handoff target *)
   l_etag : string;
 }
 
@@ -63,6 +65,14 @@ type event =
   | Lease_cas_completed of { op : op; result : cas_result }
   | Followers_chosen of peer list
   | Timer_fired of { timer : timer; generation : int }
+  (* moving cells between nodes *)
+  | Shed of { cells : cell_id list; target : peer }
+      (** Hand these resident cells to [target] once they go quiet. *)
+  | Drain of peer list
+      (** Stop taking ownership, hand every cell to these peers, then retire
+          the lease and exit. *)
+  | Drain_checked of { op : op; result : (unit, failure) result }
+      (** Every capture of this node is in the bucket. *)
   (* ingress *)
   | Request of { req : req; cell : cell_id }
   | Invalidate_remote of cell_id
@@ -93,6 +103,10 @@ type eff =
       (** The lease now names these followers, so the executor may ship to
           them, starting with the backlog that is not yet in the bucket. *)
   | Halt of string
+  | Check_drained of { op : op }
+  | Exit_node of string  (** a clean exit: the lease is already retired *)
+  | Hand_off of { cell : cell_id; peer : peer }
+      (** Ask [peer] to activate a cell this node just released to it. *)
   | Read_owner of { op : op; cell : cell_id }
   | Read_lease of { op : op; cell : cell_id; node : node_id }
   | Recover_log of { op : op; cell : cell_id; lease : lease }

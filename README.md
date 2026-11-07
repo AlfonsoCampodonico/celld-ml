@@ -106,10 +106,11 @@ stateDiagram-v2
   Acquiring --> Reading_owner: CAS rejected or ambiguous
   Acquiring --> Restoring: CAS applied (epoch + 1)
   Restoring --> Resident
-  Resident --> Ensuring: idle
+  Resident --> Ensuring: idle, shed or draining
   Ensuring --> Cleaning: durable
   Cleaning --> Releasing: runtime stopped
   Releasing --> Inactive: own.json node = ""
+  Releasing --> Remote: handed off (shed or drain)
   Remote --> Inactive: lease ends or invalidated
 ```
 
@@ -150,11 +151,18 @@ claim its cells.
   2. seals its followers;
   3. uploads their tails;
   4. CASes the record to `sealed`.
+- **Rebalance and drain.** Each lease carries the node's resident cell
+  count. A node more than one cell above the fair share marks its excess
+  cells to move. Each one is handed off when it goes quiet: made durable,
+  stopped, released, and then activated on the target (`/peer/activate`).
+  Requests that arrive meanwhile wait and follow the cell.
+  `POST /.well-known/celld/drain` stops a node from taking ownership and
+  hands off every cell. Once its log is in the bucket, the node writes an
+  expired lease with no open log and exits 0, so no one has to recover it.
 - **Signed peer HTTP.** Requests are HMAC-SHA256-signed with a fleet secret
   that is created once with a conditional write.
 
-The fork leaves out alarms, queues, cron, rebalance, drain, WebSockets and
-the tunnel. A forwarded request is one signed POST.
+The fork leaves out alarms, queues, cron, WebSockets and the tunnel. A forwarded request is one signed POST.
 
 ## Layout
 
@@ -227,6 +235,10 @@ dune build @runtest --root . --build-dir _build_all
 - **Compaction:** 150 writes left one level-1 snapshot plus 22 files
   instead of 150. After a takeover the new owner restored 150 from them,
   and after it went idle the cell was down to a single file.
+- **Rebalance and drain:** n1 restarted holding all 9 cells and spread
+  them 3/3/3 within one discovery round. Draining n2 then moved its 3 cells
+  to n1 and n3, and n2 exited with code 0. All 9 counters kept their
+  values.
 - **Partition:** a node cut off from the bucket logged
   `SELF-FENCE: node lease expired` and exited with code 3, and another node
   took over its cell at the next epoch with its state intact.

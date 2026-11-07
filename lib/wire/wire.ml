@@ -135,6 +135,8 @@ let lease_to_json (l : lease) =
          ("protocol", Int l.l_protocol);
          ("log", Str (string_of_log_state l.l_log));
          ("followers", Arr (List.map (fun p -> Arr [ Str p.p_node; Str p.p_addr ]) l.l_followers));
+         ("cells", Int l.l_cells);
+         ("draining", Bool l.l_draining);
        ])
 
 let lease_of_json body ~etag =
@@ -155,6 +157,8 @@ let lease_of_json body ~etag =
           l_protocol = int_field "protocol" j;
           l_log = log_state_of_string (str_field "log" j);
           l_followers = followers;
+          l_cells = int_field "cells" j;
+          l_draining = (match field "draining" j with Some (Bool b) -> b | _ -> false);
           l_etag = etag;
         }
 

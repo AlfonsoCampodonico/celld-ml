@@ -28,6 +28,7 @@ let idle_ms = arg "idle-ms" "Evict a cell idle this long." Cmdliner.Arg.int 30_0
 let durability = arg "durability" "fleet or bucket." Cmdliner.Arg.string "fleet"
 let max_followers = arg "followers" "Followers to recruit in fleet mode." Cmdliner.Arg.int 2
 let compact_every = arg "compact-every" "Upload a level-1 snapshot every this many commits, then delete what it covers." Cmdliner.Arg.int 64
+let rebalance = arg "rebalance" "Shed cells to less loaded nodes." Cmdliner.Arg.bool true
 let upload_delay_ms = arg "upload-delay-ms" "Delay before each LTX upload (to show the fleet path)." Cmdliner.Arg.int 0
 
 let public_port = 8080
@@ -89,6 +90,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
     mutable next_seq : int;
     mutable active : peer list;  (** followers recorded in our lease and caught up *)
     mutable want : peer list;
+    mutable peers : lease list;  (** live, non-draining leases of other nodes, from the last discovery *)
+    mutable last_shed_ms : int;
     held : (string, held) Hashtbl.t;
     disk : D.t;  (** follower log: what [held] is rebuilt from after a restart *)
     disk_lock : Lwt_mutex.t;
@@ -243,8 +246,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
               else drop_follower t p))
       peers
 
-  (* Recruit live peers from the bucket's node leases. *)
-  let recruit t =
+  (* Live, compatible, non-draining leases of the other nodes. *)
+  let discover t =
     B.list t.bucket ~prefix:"nodes/" >>= function
     | Error _ -> Lwt.return_unit
     | Ok keys ->
@@ -253,20 +256,49 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
             B.get t.bucket k >|= function
             | Ok (Some (body, etag)) -> (
                 match Wire.lease_of_json body ~etag with
-                | Ok l when l.l_node <> t.me && l.l_expires_ms > now_ms () && l.l_protocol = 5 -> Some { p_node = l.l_node; p_addr = l.l_addr }
+                | Ok l when l.l_node <> t.me && l.l_expires_ms > now_ms () && l.l_protocol = 5 && not l.l_draining -> Some l
                 | _ -> None)
             | _ -> None)
           keys
-        >|= fun live ->
-        let keep = List.filter (fun p -> List.exists (fun q -> q.p_node = p.p_node) live) t.want in
-        let fresh = List.filter (fun p -> not (List.exists (fun q -> q.p_node = p.p_node) keep)) live in
-        let rec take n = function [] -> [] | x :: r -> if n <= 0 then [] else x :: take (n - 1) r in
-        let want = take (max_followers ()) (keep @ fresh) in
-        if want <> t.want then begin
-          Log.info (fun m -> m "followers -> [%s]" (String.concat "," (List.map (fun p -> p.p_node) want)));
-          t.want <- want;
-          t.mailbox (Followers_chosen want)
-        end
+        >|= fun leases -> t.peers <- leases
+
+  (* Recruit followers from the discovered peers. *)
+  let recruit t =
+    let live = List.map (fun l -> { p_node = l.l_node; p_addr = l.l_addr }) t.peers in
+    let keep = List.filter (fun p -> List.exists (fun q -> q.p_node = p.p_node) live) t.want in
+    let fresh = List.filter (fun p -> not (List.exists (fun q -> q.p_node = p.p_node) keep)) live in
+    let rec take n = function [] -> [] | x :: r -> if n <= 0 then [] else x :: take (n - 1) r in
+    let want = take (max_followers ()) (keep @ fresh) in
+    if want <> t.want then begin
+      Log.info (fun m -> m "followers -> [%s]" (String.concat "," (List.map (fun p -> p.p_node) want)));
+      t.want <- want;
+      t.mailbox (Followers_chosen want)
+    end
+
+  (* Rebalance: lease counts lag by up to ttl/3, so shed only well above the
+     fair share, and wait between rounds for the counts to settle. *)
+  let rebalance_once t =
+    let mine = Hashtbl.length t.runtimes in
+    let n = 1 + List.length t.peers in
+    let total = mine + List.fold_left (fun a l -> a + l.l_cells) 0 t.peers in
+    let fair = (total + n - 1) / n in
+    if rebalance () && t.peers <> [] && mine > fair + 1 && now_ms () - t.last_shed_ms > 3 * ttl_ms () then begin
+      t.last_shed_ms <- now_ms ();
+      (* Fill the least loaded peers up to the fair share, in turn. *)
+      let peers = List.sort (fun a b -> compare a.l_cells b.l_cells) t.peers in
+      let spare = ref (Hashtbl.fold (fun id _ acc -> id :: acc) t.runtimes []) and left = ref (mine - fair) in
+      List.iter
+        (fun l ->
+          let k = min !left (fair - l.l_cells) in
+          if k > 0 then begin
+            let cells = List.filteri (fun i _ -> i < k) !spare in
+            spare := List.filteri (fun i _ -> i >= k) !spare;
+            left := !left - k;
+            Log.info (fun m -> m "rebalance: %d cells here, fair share %d; shedding %d to %s" mine fair k l.l_node);
+            t.mailbox (Shed { cells; target = { p_node = l.l_node; p_addr = l.l_addr } })
+          end)
+        peers
+    end
 
   (* ---- the follower log on disk ----
      A follower writes every batch and every seal to its block device before
@@ -437,6 +469,22 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
     | Halt reason ->
         Log.err (fun m -> m "SELF-FENCE: %s" reason);
         exit 3
+    | Check_drained { op } ->
+        Lwt.async (fun () ->
+            let rec wait n =
+              if Queue.is_empty t.log then Lwt.return (Ok ())
+              else if n = 0 then Lwt.return (Error (Definite "uploads pending"))
+              else sleep_ms 100 >>= fun () -> wait (n - 1)
+            in
+            wait 50 >|= fun result -> push t (Drain_checked { op; result }))
+    | Hand_off { cell; peer } ->
+        Lwt.async (fun () ->
+            peer_call t peer.p_addr ~meth:"POST" ~path:"/peer/activate" ~headers:[ ("x-cells-scope", cell) ] "" >|= function
+            | Ok { status = 200; _ } -> Log.info (fun m -> m "handed %s to %s" cell peer.p_node)
+            | _ -> Log.warn (fun m -> m "handoff of %s to %s not confirmed; it activates on next use" cell peer.p_node))
+    | Exit_node reason ->
+        Log.info (fun m -> m "%s: lease retired, exiting" reason);
+        exit 0
     | Read_self_lease { op } ->
         async_bucket t (fun () ->
             B.get t.bucket (Wire.lease_key t.me) >|= fun r ->
@@ -636,6 +684,11 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
   let public t (r : Celld_http.request) =
     match cell_of_target r.target with
     | _ when fst (Celld_http.path_and_query r.target) = "/.well-known/celld/health" -> Lwt.return (text 200 "ok\n")
+    | _ when r.meth = "POST" && fst (Celld_http.path_and_query r.target) = "/.well-known/celld/drain" ->
+        let targets = List.map (fun l -> { p_node = l.l_node; p_addr = l.l_addr }) t.peers in
+        Log.info (fun m -> m "draining to [%s]" (String.concat "," (List.map (fun p -> p.p_node) targets)));
+        push t (Drain targets);
+        Lwt.return (text 202 "draining\n")
     | _ when fst (Celld_http.path_and_query r.target) = "/state" -> Lwt.return { Celld_http.status = 200; headers = [ ("content-type", "application/json") ]; body = state_json t }
     | Some (cell, path, query) when Handlers.valid_cell cell && Handlers.dispatch cell <> None ->
         serve_cell t cell ~meth:r.meth ~path ~query ~body:r.body
@@ -654,6 +707,22 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
                 let path, query = Celld_http.path_and_query target in
                 serve_cell t ~forwarded:true cell ~meth ~path ~query ~body:r.body
             | _ -> Lwt.return (text 400 "bad forward\n"))
+        | "POST", "/peer/activate" -> (
+            (* Resolve the cell as a request would, without running a handler. *)
+            match Celld_http.header "x-cells-scope" r.headers with
+            | Some cell when Handlers.valid_cell cell && Handlers.dispatch cell <> None -> (
+                (* A cached route may still name the node handing it over. *)
+                push t (Invalidate_remote cell);
+                resolve t cell >>= fun (req, route) ->
+                match route with
+                | Ok (Local _) ->
+                    let p, u = Lwt.wait () in
+                    Hashtbl.replace t.releases req u;
+                    push t (Output_at { req; position = None });
+                    p >|= fun _ -> text 200 "active\n"
+                | Ok (Remote p) -> Lwt.return (text 409 ("owned by " ^ p.p_node ^ "\n"))
+                | Error e -> Lwt.return (text 503 (string_of_request_error e ^ "\n")))
+            | _ -> Lwt.return (text 400 "bad activate\n"))
         | "POST", "/peer/log/append" -> (
             match Wire.decode_batch r.body with
             | Error e -> Lwt.return (text 400 (e ^ "\n"))
@@ -710,6 +779,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         next_seq = 1;
         active = [];
         want = [];
+        peers = [];
+        last_shed_ms = 0;
         held = Hashtbl.create 4;
         disk;
         disk_lock = Lwt_mutex.create ();
@@ -732,9 +803,13 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
     H.serve stack ~port:public_port (public t);
     Lwt.async (fun () -> actor t stream);
     t.mailbox Start_node;
-    if t.fleet then
-      Lwt.async (fun () ->
-          let rec loop () = recruit t >>= fun () -> sleep_ms 2_000 >>= loop in
-          sleep_ms 500 >>= loop);
+    Lwt.async (fun () ->
+        let rec loop () =
+          discover t >>= fun () ->
+          if t.fleet then recruit t;
+          rebalance_once t;
+          sleep_ms 2_000 >>= loop
+        in
+        sleep_ms 500 >>= loop);
     S.listen stack
 end

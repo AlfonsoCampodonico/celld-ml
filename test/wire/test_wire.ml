@@ -5,7 +5,7 @@ let check name c = if not c then (Printf.printf "FAIL %s\n" name; exit 1) else P
 
 let () =
   let l = { l_node = "n1"; l_session = "s\"x"; l_addr = "10.0.0.11:8081"; l_expires_ms = 1761264000123; l_protocol = 5;
-            l_log = Log_open; l_followers = [ { p_node = "n2"; p_addr = "10.0.0.12:8081" } ]; l_etag = "" } in
+            l_log = Log_open; l_followers = [ { p_node = "n2"; p_addr = "10.0.0.12:8081" } ]; l_cells = 3; l_draining = true; l_etag = "" } in
   check "lease json round trip" (Wire.lease_of_json (Wire.lease_to_json l) ~etag:"e9" = Ok { l with l_etag = "e9" });
   check "owner json round trip" (Wire.owner_of_json (Wire.owner_to_json ~node:(Some "n1") ~epoch:7) ~etag:"x" = Ok { o_node = Some "n1"; o_epoch = 7; o_etag = "x" });
   check "released owner" (match Wire.owner_of_json "{\"node\":\"\",\"epoch\":3}" ~etag:"" with Ok r -> r.o_node = None && r.o_epoch = 3 | _ -> false);

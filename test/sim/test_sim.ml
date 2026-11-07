@@ -62,6 +62,9 @@ and exec n (fx : eff) =
   | Cas_lease { op; guard; lease } -> feed n (Lease_cas_completed { op; result = cas (lease_key me) guard (Lease_obj lease) })
   | Activate_followers _ -> ()
   | Halt reason -> n.halted <- Some reason
+  | Hand_off _ -> ()
+  | Check_drained { op } -> feed n (Drain_checked { op; result = Ok () })
+  | Exit_node reason -> n.halted <- Some ("exit: " ^ reason); n.alive <- false
   | Read_owner { op; cell } ->
       let result =
         match Hashtbl.find_opt bucket (own_key cell) with
@@ -226,5 +229,41 @@ let () =
   check "unproven write is not acknowledged" (match List.assoc_opt w b2.released with Some (Error (Durability_unproven _)) -> true | _ -> false);
   let _, res = request b2 "Counter:y" in
   check "reset cell restores from the bucket at a new epoch" (res = Ok (Local (we + 1)));
+
+  (* Shed: a resident cell moves to the target once quiet; a request that
+     arrives during the handoff follows it. *)
+  let c = mk "c" in
+  feed c Start_node;
+  let r, res = request b2 "Kv:shed" in
+  check "b2 owns Kv:shed" (res = Ok (Local 1));
+  feed b2 (Output_at { req = r; position = None });
+  let target = { p_node = "c"; p_addr = "c:8081" } in
+  feed b2 (Shed { cells = [ "Kv:shed" ]; target });
+  advance 1_000;
+  check "shed cell released by b2" (owner "Kv:shed" = (None, 1));
+  let _, res = request b2 "Kv:shed" in
+  check "b2 forwards the shed cell to c" (match res with Ok (Remote p) -> p.p_node = "c" | _ -> false);
+  let r, res = request c "Kv:shed" in
+  feed c (Output_at { req = r; position = None });
+  check "c activates it at e2" (res = Ok (Local 2) && owner "Kv:shed" = (Some "c", 2));
+
+  (* Drain: c hands its cells to b2, will not take new ones, then retires
+     its lease and exits cleanly. *)
+  let r, _ = request c "Kv:other" in
+  feed c (Output_at { req = r; position = None });
+  feed c (Drain [ { p_node = "b"; p_addr = "b:8081" } ]);
+  check "draining shows in c's lease" (match Hashtbl.find_opt bucket (lease_key "c") with Some (Lease_obj l, _) -> l.l_draining | _ -> false);
+  advance 1_000;
+  check "drain released both cells" (owner "Kv:shed" = (None, 2) && fst (owner "Kv:other") = None);
+  advance 1_000;
+  check "drained node exits cleanly" (c.halted = Some "exit: drained");
+  check "retired lease is expired with no open log"
+    (match Hashtbl.find_opt bucket (lease_key "c") with Some (Lease_obj l, _) -> l.l_log = Log_none && l.l_expires_ms <= !now | _ -> false);
+  (* b2 still has the route to c cached; forwarding to the exited c fails
+     to connect, which invalidates it. *)
+  feed b2 (Invalidate_remote "Kv:shed");
+  let r, res = request b2 "Kv:shed" in
+  feed b2 (Output_at { req = r; position = None });
+  check "b2 takes the drained cell without recovery, at e3" (res = Ok (Local 3));
 
   Printf.printf "%d checks passed\n" !pass
