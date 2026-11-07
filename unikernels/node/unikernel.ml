@@ -32,6 +32,10 @@ let idle_ms = arg "idle-ms" "Evict a cell idle this long." Cmdliner.Arg.int 30_0
 let durability = arg "durability" "fleet or bucket." Cmdliner.Arg.string "fleet"
 let max_followers = arg "followers" "Followers to recruit in fleet mode." Cmdliner.Arg.int 2
 let compact_every = arg "compact-every" "Upload a level-1 snapshot every this many commits, then delete what it covers." Cmdliner.Arg.int 64
+let dns_server = arg "dns" "DNS server (IPv4) for outbound fetch from cells; without it only IP-literal URLs work." Cmdliner.Arg.string ""
+let fetch_private = arg "fetch-private" "Let cells fetch private and loopback addresses (the bucket and peer ports stay refused)." Cmdliner.Arg.bool false
+let max_memory_mb = arg "max-memory-mb" "Shed idle cells while cell memory (heap, SQLite pages, JS heaps) is above this; 0 disables." Cmdliner.Arg.int 0
+let max_resident = arg "max-resident-cells" "Shed idle cells above this many resident; 0 disables." Cmdliner.Arg.int 0
 let rebalance = arg "rebalance" "Shed cells to less loaded nodes." Cmdliner.Arg.bool true
 let upload_delay_ms = arg "upload-delay-ms" "Delay before each LTX upload (to show the fleet path)." Cmdliner.Arg.int 0
 
@@ -86,7 +90,9 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
     epoch : int;
     mutable snap_txid : int;  (** last snapshot the bucket has *)
     mutable js : Celld_js.t option;  (** the class script's context, for JS classes *)
-    script : string;
+    mutable script : string;
+    mutable script_etag : string;  (** the deployment this context runs *)
+    mutable last_used : int;
   }
 
   type t = {
@@ -110,6 +116,11 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
     pumping : (cell_id, unit) Hashtbl.t;  (** cells whose outbox is being delivered *)
     tunnels : (string, H.conn list) Hashtbl.t;  (** idle peer tunnels, by peer address *)
     sockets : (cell_id, (string, ws) Hashtbl.t) Hashtbl.t;  (** WebSockets this node terminates, by cell *)
+    cell_locks : (cell_id, Lwt_mutex.t) Hashtbl.t;  (** one handler at a time per cell, across a call's waits *)
+    dns_cache : (string, Ipaddr.t * int) Hashtbl.t;  (** host -> address, expiry *)
+    tls_clients : (string, Tls.Config.client) Hashtbl.t;  (** outbound HTTPS, per host *)
+    bucket_ep : Ipaddr.t * int;
+    class_versions : (string, string) Hashtbl.t;  (** newest known script etag per JS class *)
     held : (string, held) Hashtbl.t;
     disk : D.t;  (** follower log: what [held] is rebuilt from after a restart *)
     disk_lock : Lwt_mutex.t;
@@ -547,9 +558,9 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
             | Ok store -> (
                 (if Handlers.is_js cell then
                    B.get t.bucket (class_key (Handlers.class_of cell)) >|= function
-                   | Ok (Some (script, _)) -> (
+                   | Ok (Some (script, etag)) -> (
                        match store.sql with
-                       | Some db -> Result.map (fun js -> Some (js, script)) (Celld_js.create ~script ~db)
+                       | Some db -> Result.map (fun js -> Some (js, (script, etag))) (Celld_js.create ~script ~db)
                        | None -> Error "JS cell without a database")
                    | Ok None -> Error ("no script for class " ^ Handlers.class_of cell ^ "; PUT it to /.well-known/celld/classes/" ^ Handlers.class_of cell)
                    | Error f -> Error (string_of_failure (fail_of f))
@@ -558,7 +569,12 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
                 | Error e -> Lwt.return (Error e)
                 | Ok js ->
                 Hashtbl.replace t.runtimes cell
-                  { store; epoch; snap_txid = Int64.to_int store.txid; js = Option.map fst js; script = (match js with Some (_, s) -> s | None -> "") };
+                  {
+                    store; epoch; snap_txid = Int64.to_int store.txid; js = Option.map fst js;
+                    script = (match js with Some (_, (s, _)) -> s | None -> "");
+                    script_etag = (match js with Some (_, (_, e)) -> e | None -> "");
+                    last_used = now_ms ();
+                  };
                 (* Each epoch opens with a snapshot of what it restored. *)
                 if store.txid > 0L then capture t cell epoch store.txid (Store.snapshot store);
                 Log.info (fun m -> m "restored %s at e%d (txid %Ld, %d files)" cell epoch store.txid (List.length ok));
@@ -878,8 +894,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
     match route with
     | Error e -> Lwt.return (H.Respond (text 503 (string_of_request_error e ^ "\n")))
     | Ok (Local epoch) -> (
-        Celld_js.headers := headers;
-        run_local t req cell epoch ~meth:"GET" ~path ~query ~body:"" >|= fun (r : Celld_http.response) ->
+        run_local t req cell epoch ~headers ~meth:"GET" ~path ~query ~body:"" () >|= fun (r : Celld_http.response) ->
         match r.status, Celld_http.header "x-celld-ws-accept" r.headers with
         | 101, Some id when key <> "" ->
             let hs =
@@ -981,42 +996,78 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
               | _ -> Lwt.return_unit)
           keys
 
-  and run_local t req cell epoch ~meth ~path ~query ~body =
-    let handler rt = match rt.js with Some js -> Some (Handlers.js js cell) | None -> Handlers.dispatch cell in
-    match Hashtbl.find_opt t.runtimes cell, Option.bind (Hashtbl.find_opt t.runtimes cell) handler with
-    | Some rt, Some handler when rt.epoch = epoch ->
-        (* Handler and commit run without yielding: the cell is serial. *)
-        let alarm_before = Handlers.alarm_of rt.store in
-        let now = now_ms () in
-        Celld_sqlite.set_now (Int64.of_int now);
-        Celld_js.sockets := (match Hashtbl.find_opt t.sockets cell with Some s -> Hashtbl.fold (fun id _ acc -> id :: acc) s [] | None -> []);
-        let reply = handler rt.store ~now_ms:now ~meth ~path ~query ~body in
-        Celld_js.headers := [];
-        Celld_js.sockets := [];
-        (* A call that left promise jobs behind poisons its context. *)
-        (match rt.js, rt.store.sql with
-        | Some js, Some db when Celld_js.poisoned js -> (
-            Celld_js.dispose js;
-            match Celld_js.create ~script:rt.script ~db with
-            | Ok fresh -> rt.js <- Some fresh; Log.warn (fun m -> m "%s: rebuilt a poisoned JS context" cell)
-            | Error e -> rt.js <- None; Log.err (fun m -> m "%s: cannot rebuild JS context: %s" cell e))
-        | _ -> ());
-        let position =
-          if reply.wrote then begin
-            let txid, ltx = Store.commit rt.store in
-            capture t cell epoch txid ltx;
-            let alarm = Handlers.alarm_of rt.store in
-            if alarm <> alarm_before then alarm_changed t cell alarm;
-            let txid = Int64.to_int txid in
-            if compact_every () > 0 && txid - rt.snap_txid >= compact_every () then begin
-              rt.snap_txid <- txid;
-              let snapshot = Store.snapshot rt.store in
-              Lwt.async (fun () -> compact t cell epoch txid snapshot)
-            end;
-            Some txid
-          end
-          else None
-        in
+  and cell_lock t cell =
+    match Hashtbl.find_opt t.cell_locks cell with
+    | Some l -> l
+    | None -> let l = Lwt_mutex.create () in Hashtbl.replace t.cell_locks cell l; l
+
+  and run_local t req cell epoch ?(headers = []) ~meth ~path ~query ~body () =
+    match Hashtbl.find_opt t.runtimes cell with
+    | Some rt when rt.epoch = epoch && (rt.js <> None || Handlers.dispatch cell <> None) ->
+        (* The cell is serial: one handler at a time, including across a JS
+           call's waits for I/O. *)
+        Lwt_mutex.with_lock (cell_lock t cell) (fun () ->
+            redeploy t cell rt >>= fun () ->
+            rt.last_used <- now_ms ();
+            let alarm_before = Handlers.alarm_of rt.store in
+            let context () =
+              let now = now_ms () in
+              Celld_sqlite.set_now (Int64.of_int now);
+              Celld_js.sockets := (match Hashtbl.find_opt t.sockets cell with Some s -> Hashtbl.fold (fun id _ acc -> id :: acc) s [] | None -> []);
+              now
+            in
+            let first =
+              let now = context () in
+              Celld_js.headers := headers;
+              let st =
+                match rt.js with
+                | Some js -> (try Handlers.js js cell rt.store ~now_ms:now ~meth ~path ~query ~body with Failure e -> Handlers.Done (Handlers.err 503 (e ^ "\n")))
+                | None -> Handlers.Done ((Option.get (Handlers.dispatch cell)) rt.store ~now_ms:now ~meth ~path ~query ~body)
+              in
+              Celld_js.headers := [];
+              st
+            in
+            let rec drive = function
+              | Handlers.Done r -> Lwt.return r
+              | Handlers.Await (ops, k) ->
+                  perform_ops t cell ops >>= fun results ->
+                  if not (match Hashtbl.find_opt t.runtimes cell with Some r -> r == rt | None -> false) then
+                    Lwt.return (Handlers.err 503 "cell stopped while its request waited\n")
+                  else begin
+                    ignore (context ());
+                    match k results with
+                    | st -> drive st
+                    | exception Failure e -> Lwt.return (Handlers.err 503 (e ^ "\n"))
+                  end
+            in
+            drive first >|= fun reply ->
+            Celld_js.sockets := [];
+            (* A call that left promise jobs behind poisons its context. *)
+            (match rt.js, rt.store.sql with
+            | Some js, Some db when Celld_js.poisoned js -> (
+                Celld_js.dispose js;
+                match Celld_js.create ~script:rt.script ~db with
+                | Ok fresh -> rt.js <- Some fresh; Log.warn (fun m -> m "%s: rebuilt a poisoned JS context" cell)
+                | Error e -> rt.js <- None; Log.err (fun m -> m "%s: cannot rebuild JS context: %s" cell e))
+            | _ -> ());
+            let position =
+              if reply.wrote then begin
+                let txid, ltx = Store.commit rt.store in
+                capture t cell epoch txid ltx;
+                let alarm = Handlers.alarm_of rt.store in
+                if alarm <> alarm_before then alarm_changed t cell alarm;
+                let txid = Int64.to_int txid in
+                if compact_every () > 0 && txid - rt.snap_txid >= compact_every () then begin
+                  rt.snap_txid <- txid;
+                  let snapshot = Store.snapshot rt.store in
+                  Lwt.async (fun () -> compact t cell epoch txid snapshot)
+                end;
+                Some txid
+              end
+              else None
+            in
+            (reply, position))
+        >>= fun ((reply : Handlers.reply), position) ->
         let p, u = Lwt.wait () in
         Hashtbl.replace t.releases req u;
         push t (Output_at { req; position });
@@ -1044,11 +1095,293 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         push t (Output_at { req; position = None });
         p >|= fun _ -> text 503 "cell runtime is not resident\n"
 
+  (* ---- operations a JS call waits for ----
+     ops: JSON array of {id, kind, ...}; results: [{id, value} | {id, error}].
+     Every operation has a deadline, so a call cannot hang its cell. *)
+  (* ---- rolling deploys ----
+     A resident JS cell runs the script version it was activated with. When
+     a newer version of its class is known, the cell switches before its
+     next event: calls are serial, so none is in flight, and its storage and
+     WebSockets stay where they are. *)
+  and redeploy t cell rt =
+    match rt.js, rt.store.sql, Hashtbl.find_opt t.class_versions (Handlers.class_of cell) with
+    | Some old, Some db, Some v when v <> rt.script_etag -> (
+        B.get t.bucket (class_key (Handlers.class_of cell)) >|= function
+        | Ok (Some (script, etag)) -> (
+            match Celld_js.create ~script ~db with
+            | Ok fresh ->
+                Celld_js.dispose old;
+                rt.js <- Some fresh;
+                rt.script <- script;
+                rt.script_etag <- etag;
+                Hashtbl.replace t.class_versions (Handlers.class_of cell) etag;
+                Log.info (fun m -> m "%s: now runs deployment %s" cell etag)
+            | Error e ->
+                (* keep the old code; the next event tries again *)
+                Log.err (fun m -> m "%s: deployment %s does not load: %s" cell etag e))
+        | _ -> ())
+    | _ -> Lwt.return_unit
+
+  and perform_ops t cell ops =
+    match Wire.of_string ops with
+    | Ok (Wire.Arr items) ->
+        Lwt_list.map_p
+          (fun op ->
+            let id = Wire.int_field "_op" op and kind = Wire.str_field "kind" op in
+            let deadline = if kind = "sleep" then Wire.int_field "ms" op + 5_000 else 30_000 in
+            Lwt.pick
+              [
+                (Lwt.catch (fun () -> perform_op t cell kind op) (fun exn -> Lwt.return (Error (Printexc.to_string exn))));
+                (sleep_ms deadline >|= fun () -> Error (kind ^ " timed out"));
+              ]
+            >|= function
+            | Ok v -> Wire.Obj [ ("_op", Wire.Int id); ("value", v) ]
+            | Error e -> Wire.Obj [ ("_op", Wire.Int id); ("error", Wire.Str e) ])
+          items
+        >|= fun results -> Wire.to_string (Wire.Arr results)
+    | Ok _ | Error _ ->
+        (* Every waiting promise gets an answer, or the call would hang. *)
+        Log.err (fun m -> m "%s: unreadable operations from a JS call" cell);
+        Lwt.return "[{\"_op\":0,\"error\":\"unreadable operations\"}]"
+
+  and response_json (r : Celld_http.response) =
+    Wire.Obj
+      [
+        ("status", Wire.Int r.status);
+        ("headers", Wire.Obj (List.map (fun (k, v) -> (String.lowercase_ascii k, Wire.Str v)) r.headers));
+        ("body", Wire.Str (Celld_js.base64 r.body));
+      ]
+
+  and perform_op t cell kind op =
+    let str = Wire.str_field and std_method m = List.mem m [ "GET"; "HEAD"; "POST"; "PUT"; "PATCH"; "DELETE"; "OPTIONS" ] in
+    match kind with
+    | "sleep" -> sleep_ms (min 30_000 (max 0 (Wire.int_field "ms" op))) >|= fun () -> Ok Wire.Null
+    | "fetch" -> outbound_fetch t op
+    | "cell" -> (
+        let target = str "cell" op and meth = String.uppercase_ascii (str "method" op) and target_path = str "path" op in
+        if not (Handlers.valid_cell target) || not (String.contains target ':') then Lwt.return (Error ("bad cell id " ^ target))
+        else if target = cell then Lwt.return (Error "a cell cannot call itself")
+        else if not (std_method meth) then Lwt.return (Error ("method not allowed: " ^ meth))
+        else if String.length target_path = 0 || target_path.[0] <> '/' || (String.length target_path > 2 && String.sub target_path 0 3 = "/__") then
+          Lwt.return (Error "bad path")
+        else
+          let path, query = Celld_http.path_and_query target_path in
+          serve_cell t target ~meth ~path ~query ~body:(Celld_js.unbase64 (str "body" op)) >|= fun r -> Ok (response_json r))
+    | "d1" -> (
+        let db = str "db" op in
+        let target = "D1:" ^ db in
+        if not (Handlers.valid_cell target) || String.contains db ':' then Lwt.return (Error ("bad database name " ^ db))
+        else
+          let body = Wire.to_string (Wire.Obj [ ("stmts", Option.value (Wire.field "stmts" op) ~default:(Wire.Arr [])); ("batch", Option.value (Wire.field "batch" op) ~default:(Wire.Bool false)) ]) in
+          serve_cell t target ~meth:"POST" ~path:"/__d1" ~query:[] ~body >|= fun (r : Celld_http.response) ->
+          if r.status <> 200 then Error (String.trim r.body) else Wire.of_string r.body)
+    | "r2" -> r2_op t op
+    | "workflow" -> (
+        let cls = str "class" op and id = str "id" op and action = str "action" op in
+        let target = cls ^ ":wf-" ^ id in
+        if not (Handlers.valid_class cls) || Handlers.dispatch (cls ^ ":x") <> None || not (Handlers.valid_cell target) || String.contains id ':' then
+          Lwt.return (Error "bad workflow class or id")
+        else
+          let path, body =
+            match action with
+            | "create" -> ("/__wf/create", Wire.to_string (Wire.Obj [ ("params", Option.value (Wire.field "params" op) ~default:Wire.Null) ]))
+            | _ -> ("/__wf/status", "")
+          in
+          serve_cell t target ~meth:"WORKFLOW" ~path ~query:[] ~body >|= fun (r : Celld_http.response) ->
+          if r.status <> 200 then Error (String.trim r.body) else Wire.of_string r.body)
+    | k -> Lwt.return (Error ("unknown operation " ^ k))
+
+  (* ---- R2 on the fleet's bucket: r2/<bucket>/<key>, metadata beside it ---- *)
+  and r2_op t op =
+    let str = Wire.str_field in
+    let bucket = str "bucket" op and key = str "key" op in
+    let valid_bucket = String.length bucket >= 3 && String.length bucket <= 63 && String.for_all (function 'a' .. 'z' | '0' .. '9' | '-' -> true | _ -> false) bucket in
+    let valid_key = String.length key > 0 && String.length key <= 1024 && not (String.contains key '\000') in
+    let obj_key = "r2/" ^ bucket ^ "/" ^ key and meta_key = "r2meta/" ^ bucket ^ "/" ^ key in
+    if not valid_bucket then Lwt.return (Error "bad bucket name (3-63 of a-z, 0-9, -)")
+    else
+      match str "op" op with
+      | ("get" | "head") as which -> (
+          B.get t.bucket obj_key >>= function
+          | Ok None -> Lwt.return (Ok Wire.Null)
+          | Error f -> Lwt.return (Error (string_of_failure (fail_of f)))
+          | Ok (Some (body, etag)) ->
+              B.get t.bucket meta_key >|= fun meta ->
+              let meta = match meta with Ok (Some (m, _)) -> (match Wire.of_string m with Ok j -> j | Error _ -> Wire.Obj []) | _ -> Wire.Obj [] in
+              Ok
+                (Wire.Obj
+                   ([ ("size", Wire.Int (String.length body)); ("etag", Wire.Str etag);
+                      ("uploaded", Option.value (Wire.field "uploaded" meta) ~default:(Wire.Int 0));
+                      ("httpMetadata", Option.value (Wire.field "httpMetadata" meta) ~default:(Wire.Obj []));
+                      ("customMetadata", Option.value (Wire.field "customMetadata" meta) ~default:(Wire.Obj [])) ]
+                   @ if which = "get" then [ ("body", Wire.Str (Celld_js.base64 body)) ] else [])))
+      | "put" when valid_key -> (
+          let body = Celld_js.unbase64 (str "body" op) in
+          B.put t.bucket obj_key body >>= function
+          | Ok (`Ok etag) ->
+              let uploaded = now_ms () in
+              let meta =
+                Wire.Obj
+                  [ ("uploaded", Wire.Int uploaded);
+                    ("httpMetadata", Option.value (Wire.field "httpMetadata" op) ~default:(Wire.Obj []));
+                    ("customMetadata", Option.value (Wire.field "customMetadata" op) ~default:(Wire.Obj [])) ]
+              in
+              B.put t.bucket meta_key (Wire.to_string meta) >|= fun _ ->
+              Ok (Wire.Obj [ ("size", Wire.Int (String.length body)); ("etag", Wire.Str etag); ("uploaded", Wire.Int uploaded) ])
+          | Ok `Precondition_failed -> Lwt.return (Error "conflict")
+          | Error f -> Lwt.return (Error (string_of_failure (fail_of f))))
+      | "delete" when valid_key -> (B.delete t.bucket obj_key >>= fun _ -> B.delete t.bucket meta_key >|= fun _ -> Ok Wire.Null)
+      | "list" -> (
+          let prefix = "r2/" ^ bucket ^ "/" in
+          B.list t.bucket ~prefix:(prefix ^ str "prefix" op) >|= function
+          | Error f -> Error (string_of_failure (fail_of f))
+          | Ok keys ->
+              let cursor = str "cursor" op and limit = max 1 (min 1000 (Wire.int_field "limit" op)) in
+              let pl = String.length prefix in
+              let names = List.sort compare (List.map (fun k -> String.sub k pl (String.length k - pl)) keys) in
+              let after = List.filter (fun k -> cursor = "" || compare k cursor > 0) names in
+              let page = List.filteri (fun i _ -> i < limit) after in
+              let truncated = List.length after > limit in
+              Ok
+                (Wire.Obj
+                   [ ("keys", Wire.Arr (List.map (fun k -> Wire.Str k) page)); ("truncated", Wire.Bool truncated);
+                     ("cursor", Wire.Str (if truncated then List.nth page (List.length page - 1) else "")) ]))
+      | _ -> Lwt.return (Error "bad R2 operation or key")
+
+  (* ---- outbound fetch ---- *)
+  and dns_resolve t host =
+    match Hashtbl.find_opt t.dns_cache host with
+    | Some (ip, until) when until > now_ms () -> Lwt.return (Ok ip)
+    | _ -> (
+        match Ipaddr.V4.of_string (dns_server ()) with
+        | Error _ -> Lwt.return (Error ("cannot resolve " ^ host ^ ": no DNS server (--dns)"))
+        | Ok server ->
+            let qid = Char.code (Mirage_crypto_rng.generate 1).[0] lsl 8 lor Char.code (Mirage_crypto_rng.generate 1).[0] in
+            let port = 20_000 + (Char.code (Mirage_crypto_rng.generate 1).[0] * 150) in
+            let q = Buffer.create 64 in
+            Buffer.add_uint16_be q qid;
+            Buffer.add_string q "\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00";
+            List.iter (fun l -> Buffer.add_char q (Char.chr (String.length l)); Buffer.add_string q l) (String.split_on_char '.' host);
+            Buffer.add_string q "\x00\x00\x01\x00\x01";
+            let answer, wake = Lwt.wait () in
+            S.UDP.listen (S.udp t.stack) ~port (fun ~src:_ ~dst:_ ~src_port:_ buf ->
+                (if Lwt.is_sleeping answer then Lwt.wakeup_later wake (Cstruct.to_string buf));
+                Lwt.return_unit);
+            let parse r =
+              (* header, question, then answers; names may be compressed *)
+              let n = String.length r in
+              let rec skip_name i = if i >= n then n else let l = Char.code r.[i] in if l = 0 then i + 1 else if l land 0xc0 = 0xc0 then i + 2 else skip_name (i + 1 + l) in
+              if n < 12 || String.get_uint16_be r 0 <> qid then Error "bad DNS response"
+              else if Char.code r.[3] land 0x0f <> 0 then Error ("cannot resolve " ^ host)
+              else
+                let an = String.get_uint16_be r 6 in
+                let i = skip_name 12 + 4 in
+                let rec answers k i =
+                  if k = 0 || i + 10 > n then Error ("no address for " ^ host)
+                  else
+                    let i = skip_name i in
+                    let typ = String.get_uint16_be r i and ttl = Int32.to_int (String.get_int32_be r (i + 4)) and len = String.get_uint16_be r (i + 8) in
+                    if typ = 1 && len = 4 && i + 14 <= n then
+                      Ok (Ipaddr.V4 (Ipaddr.V4.of_octets_exn (String.sub r (i + 10) 4)), max 1 ttl)
+                    else answers (k - 1) (i + 10 + len)
+                in
+                answers an i
+            in
+            S.UDP.write ~src_port:port ~dst:(Ipaddr.V4 server) ~dst_port:53 (S.udp t.stack) (Cstruct.of_string (Buffer.contents q)) >>= fun _ ->
+            Lwt.pick [ (answer >|= fun r -> Some r); (sleep_ms 3_000 >|= fun () -> None) ] >|= fun r ->
+            S.UDP.unlisten (S.udp t.stack) ~port;
+            match r with
+            | None -> Error ("DNS timeout for " ^ host)
+            | Some r -> (
+                match parse r with
+                | Ok (ip, ttl) -> Hashtbl.replace t.dns_cache host (ip, now_ms () + (min ttl 300 * 1000)); Ok ip
+                | Error e -> Error e))
+
+  (* Cells may not reach the bucket or the peer port (both trust the fleet),
+     and by default nothing private or local. *)
+  and fetch_allowed t ip port =
+    let bip, bport = t.bucket_ep in
+    let peer_hosts = List.filter_map (fun l -> Option.map fst (try Some (parse_addr l.l_addr) with Invalid_argument _ -> None)) t.peers in
+    let own = fst (parse_addr (advertise ())) in
+    if Ipaddr.compare ip bip = 0 && port = bport then Error "the bucket is not reachable from cells"
+    else if port = internal_port && List.exists (fun h -> Ipaddr.compare h ip = 0) (own :: peer_hosts) then Error "peer ports are not reachable from cells"
+    else if (not (fetch_private ())) && (match ip with
+              | Ipaddr.V4 v4 ->
+                  List.exists (fun (p, _) -> Ipaddr.V4.Prefix.mem v4 (Ipaddr.V4.Prefix.of_string_exn p))
+                    [ ("10.0.0.0/8", ()); ("172.16.0.0/12", ()); ("192.168.0.0/16", ()); ("127.0.0.0/8", ()); ("169.254.0.0/16", ()); ("0.0.0.0/8", ()); ("100.64.0.0/10", ()) ]
+              | Ipaddr.V6 v6 -> Ipaddr.V6.is_private v6 || Ipaddr.V6.compare v6 Ipaddr.V6.localhost = 0)
+    then Error "private addresses are not reachable from cells (--fetch-private)"
+    else Ok ()
+
+  and outbound_fetch t op =
+    let url = Wire.str_field "url" op in
+    let scheme, rest =
+      if String.length url > 8 && String.sub url 0 8 = "https://" then ("https", String.sub url 8 (String.length url - 8))
+      else if String.length url > 7 && String.sub url 0 7 = "http://" then ("http", String.sub url 7 (String.length url - 7))
+      else ("", url)
+    in
+    if scheme = "" then Lwt.return (Error ("only http and https URLs: " ^ url))
+    else
+      let authority, target = match String.index_opt rest '/' with Some i -> (String.sub rest 0 i, String.sub rest i (String.length rest - i)) | None -> (rest, "/") in
+      let authority = match String.index_opt authority '@' with Some i -> String.sub authority (i + 1) (String.length authority - i - 1) | None -> authority in
+      let target = match String.index_opt target '#' with Some i -> String.sub target 0 i | None -> target in
+      let host, port =
+        match String.rindex_opt authority ':' with
+        | Some i when not (String.contains authority ']') -> (String.sub authority 0 i, int_of_string_opt (String.sub authority (i + 1) (String.length authority - i - 1)))
+        | _ -> (authority, None)
+      in
+      let port = Option.value port ~default:(if scheme = "https" then 443 else 80) in
+      (match Ipaddr.of_string host with Ok ip -> Lwt.return (Ok ip) | Error _ -> dns_resolve t host) >>= function
+      | Error e -> Lwt.return (Error e)
+      | Ok ip -> (
+          match fetch_allowed t ip port with
+          | Error e -> Lwt.return (Error e)
+          | Ok () -> (
+              let tls =
+                if scheme = "http" then Ok None
+                else
+                  match Hashtbl.find_opt t.tls_clients host with
+                  | Some c -> Ok (Some c)
+                  | None -> (match B.tls_config ~host () with Ok c -> Hashtbl.replace t.tls_clients host c; Ok (Some c) | Error e -> Error e)
+              in
+              match tls with
+              | Error e -> Lwt.return (Error ("TLS: " ^ e))
+              | Ok tls ->
+                  let connect () =
+                    match tls with
+                    | None -> H.tcp_connect t.stack ip port
+                    | Some config -> (
+                        S.TCP.create_connection (S.tcp t.stack) (ip, port) >>= function
+                        | Error e -> Lwt.return (Error (Fmt.str "%a" S.TCP.pp_error e))
+                        | Ok flow -> (
+                            let peer = match Domain_name.of_string host with Ok d -> Result.to_option (Domain_name.host d) | Error _ -> None in
+                            Tls_flow.client_of_flow config ?host:peer flow >|= function
+                            | Ok c -> Ok (tls_conn c)
+                            | Error e -> Error (Fmt.str "tls: %a" Tls_flow.pp_write_error e)))
+                  in
+                  let headers =
+                    match Wire.field "headers" op with
+                    | Some (Wire.Obj l) ->
+                        List.filter_map
+                          (fun (k, v) -> match String.lowercase_ascii k, v with ("host" | "connection" | "content-length" | "transfer-encoding"), _ -> None | k, Wire.Str v -> Some (k, v) | _ -> None)
+                          l
+                    | _ -> []
+                  in
+                  let default_host = if (scheme = "http" && port = 80) || (scheme = "https" && port = 443) then host else host ^ ":" ^ string_of_int port in
+                  H.request_over ~connect ~default_host ~timeout_ns:30_000_000_000L
+                    { Celld_http.meth = String.uppercase_ascii (Wire.str_field "method" op); target; headers; body = Celld_js.unbase64 (Wire.str_field "body" op) }
+                  >|= function
+                  | Ok r when String.length r.body > 16 lsl 20 -> Error "response larger than 16 MiB"
+                  | Ok r -> Ok (response_json r)
+                  | Error (`Connect e) -> Error ("connect: " ^ e)
+                  | Error (`Io e) -> Error e
+                  | Error `Timeout -> Error "timeout"))
+
   and serve_cell t ?(forwarded = false) ?(retried = false) cell ~meth ~path ~query ~body =
     resolve t cell >>= fun (req, route) ->
     match route with
     | Error e -> Lwt.return (text 503 (string_of_request_error e ^ "\n"))
-    | Ok (Local epoch) -> run_local t req cell epoch ~meth ~path ~query ~body
+    | Ok (Local epoch) -> run_local t req cell epoch ~meth ~path ~query ~body ()
     | Ok (Remote _) when forwarded -> Lwt.return (text 421 "not the owner\n")
     | Ok (Remote peer) -> (
         let target = path ^ (if query = [] then "" else "?" ^ String.concat "&" (List.map (fun (k, v) -> Celld_http.pct_encode k ^ "=" ^ Celld_http.pct_encode v) query)) in
@@ -1081,7 +1414,13 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
     else None
 
   let state_json t =
-    let cells = List.map (fun (id, phase, active, barriers) -> Wire.Obj [ ("cell", Str id); ("phase", Str phase); ("active", Int active); ("barriers", Int barriers) ]) (Core.cells t.core) in
+    let cells =
+      List.map
+        (fun (id, phase, active, barriers) ->
+          let code = match Hashtbl.find_opt t.runtimes id with Some rt when rt.script_etag <> "" -> [ ("deployment", Wire.Str rt.script_etag) ] | _ -> [] in
+          Wire.Obj ([ ("cell", Wire.Str id); ("phase", Wire.Str phase); ("active", Wire.Int active); ("barriers", Wire.Int barriers) ] @ code))
+        (Core.cells t.core)
+    in
     Wire.to_string
       (Wire.Obj
          [
@@ -1090,6 +1429,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
            ("durability", Str (if t.fleet then "fleet" else "bucket"));
            ("followers", Arr (List.map (fun p -> Wire.Str p.p_node) t.active));
            ("log_backlog", Int (Queue.length t.log));
+           ("resident", Int (Hashtbl.length t.runtimes));
            ("cells", Arr cells);
          ])
     ^ "\n"
@@ -1151,9 +1491,13 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
           match r.meth with
           | "PUT" -> (
               B.put t.bucket (class_key cls) r.body >|= function
-              | Ok (`Ok _) ->
-                  Log.info (fun m -> m "deployed class %s (%d bytes)" cls (String.length r.body));
-                  text 200 ("deployed " ^ cls ^ "; cells pick it up when they next activate\n")
+              | Ok (`Ok etag) ->
+                  Log.info (fun m -> m "deployed class %s (%d bytes) as %s" cls (String.length r.body) etag);
+                  Hashtbl.replace t.class_versions cls etag;
+                  (* tell the fleet; the periodic check covers a missed peer *)
+                  let note = Wire.to_string (Wire.Obj [ ("class", Wire.Str cls); ("etag", Wire.Str etag) ]) in
+                  List.iter (fun l -> Lwt.async (fun () -> peer_call t l.l_addr ~meth:"POST" ~path:"/peer/deploy" note >|= ignore)) t.peers;
+                  text 200 ("deployed " ^ cls ^ " as " ^ etag ^ "; resident cells switch at their next event\n")
               | _ -> text 503 "could not store the script\n")
           | "GET" -> (B.get t.bucket (class_key cls) >|= function Ok (Some (s, _)) -> { Celld_http.status = 200; headers = [ ("content-type", "text/javascript") ]; body = s } | _ -> text 404 "no such class\n")
           | _ -> Lwt.return (text 405 "PUT or GET\n"))
@@ -1196,6 +1540,12 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
                 | Ok (Remote p) -> Lwt.return (text 409 ("owned by " ^ p.p_node ^ "\n"))
                 | Error e -> Lwt.return (text 503 (string_of_request_error e ^ "\n")))
             | _ -> Lwt.return (text 400 "bad activate\n"))
+        | "POST", "/peer/deploy" -> (
+            match Wire.of_string r.body with
+            | Ok j when Handlers.valid_class (Wire.str_field "class" j) ->
+                Hashtbl.replace t.class_versions (Wire.str_field "class" j) (Wire.str_field "etag" j);
+                Lwt.return (text 200 "ok\n")
+            | _ -> Lwt.return (text 400 "bad deploy note\n"))
         | "POST", "/peer/log/append" -> (
             match Wire.decode_batch r.body with
             | Error e -> Lwt.return (text 400 (e ^ "\n"))
@@ -1222,6 +1572,50 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         | _ -> Lwt.return (text 404 "unknown peer endpoint\n"))
 
   (* The fleet secret: created once, conditionally, by whichever node is first. *)
+  (* Every few rounds, learn the current script version of each class with
+     resident cells (a deploy note from a peer can be lost). *)
+  let deploy_round = ref 0
+
+  let check_deployments t =
+    incr deploy_round;
+    if !deploy_round mod 5 = 0 then begin
+      let classes = Hashtbl.fold (fun cell rt acc -> if rt.js <> None && not (List.mem (Handlers.class_of cell) acc) then Handlers.class_of cell :: acc else acc) t.runtimes [] in
+      List.iter
+        (fun cls -> Lwt.async (fun () -> B.get t.bucket (class_key cls) >|= function Ok (Some (_, etag)) -> Hashtbl.replace t.class_versions cls etag | _ -> ()))
+        classes
+    end
+
+  (* Memory the cells hold: the OCaml heap, SQLite page images, JS heaps. *)
+  let cell_memory t =
+    let heap = (Gc.quick_stat ()).heap_words * (Sys.word_size / 8) in
+    Hashtbl.fold
+      (fun _ rt acc -> acc + (Array.length rt.store.pages * Store.page_size) + match rt.js with Some js -> Celld_js.memory js | None -> 0)
+      t.runtimes heap
+
+  (* Shed the least recently used idle cells (no sockets, no handler
+     running) while over the memory budget or the residency cap. *)
+  let shed_if_needed t =
+    let resident = Hashtbl.length t.runtimes in
+    let mem = cell_memory t in
+    let over_cap = if max_resident () > 0 then resident - max_resident () else 0 in
+    let over_mem = max_memory_mb () > 0 && mem > max_memory_mb () * 1_048_576 in
+    if over_cap > 0 || over_mem then begin
+      let idle =
+        Hashtbl.fold
+          (fun cell rt acc ->
+            let busy = match Hashtbl.find_opt t.cell_locks cell with Some l -> Lwt_mutex.is_locked l | None -> false in
+            if busy || Hashtbl.mem t.sockets cell then acc else (rt.last_used, cell) :: acc)
+          t.runtimes []
+        |> List.sort compare |> List.map snd
+      in
+      let k = max over_cap (if over_mem then max 1 (resident / 10) else 0) in
+      let victims = List.filteri (fun i _ -> i < k) idle in
+      if victims <> [] then begin
+        Log.warn (fun m -> m "shedding %d idle cells (%d resident, %d MiB of cell memory)" (List.length victims) resident (mem / 1_048_576));
+        t.mailbox (Evict victims)
+      end
+    end
+
   let is_ws_upgrade (r : Celld_http.request) =
     r.meth = "GET"
     && (match Celld_http.header "upgrade" r.headers with Some v -> String.lowercase_ascii (String.trim v) = "websocket" | None -> false)
@@ -1337,7 +1731,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
     read_secrets sec >>= fun secrets ->
     let secret k = Option.value (List.assoc_opt k secrets) ~default:"" in
     D.open_ blk >>= fun (disk, records) ->
-    let bucket =
+    let bucket, bucket_ep =
       let b = bucket_addr () in
       if String.length b > 5 && String.sub b 0 5 = "s3://" then begin
         let rest = String.sub b 5 (String.length b - 5) in
@@ -1354,14 +1748,22 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         if secret "s3_access_key" = "" || secret "s3_secret_key" = "" then
           Log.warn (fun m -> m "no S3 credentials on the secrets device (s3_access_key=..., s3_secret_key=...)");
         let creds = { Celld_s3.access_key = secret "s3_access_key"; secret_key = secret "s3_secret_key"; region = s3_region () } in
-        B.create ~host ?tls ~s3:{ B.bucket = name; creds } stack ip port
+        (B.create ~host ?tls ~s3:{ B.bucket = name; creds } stack ip port, (ip, port))
       end
       else
         let ip, port = parse_addr b in
-        B.create stack ip port
+        (B.create stack ip port, (ip, port))
     in
     let session = random_hex 8 in
     Celld_sqlite.seed (Mirage_crypto_rng.generate 32);
+    Celld_js.random_source := Mirage_crypto_rng.generate;
+    Celld_js.logger :=
+      (fun level msg ->
+        match level with
+        | "error" -> Log.err (fun m -> m "js: %s" msg)
+        | "warn" -> Log.warn (fun m -> m "js: %s" msg)
+        | "debug" -> Log.debug (fun m -> m "js: %s" msg)
+        | _ -> Log.info (fun m -> m "js: %s" msg));
     let config = { default_config with ttl_ms = ttl_ms (); idle_ms = idle_ms () } in
     let core = Core.create ~config ~node:me ~session ~addr:(advertise ()) () in
     let stream, push = Lwt_stream.create () in
@@ -1383,6 +1785,11 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
         pumping = Hashtbl.create 16;
         tunnels = Hashtbl.create 8;
         sockets = Hashtbl.create 16;
+        cell_locks = Hashtbl.create 16;
+        dns_cache = Hashtbl.create 16;
+        tls_clients = Hashtbl.create 8;
+        bucket_ep;
+        class_versions = Hashtbl.create 8;
         held = Hashtbl.create 4;
         disk;
         disk_lock = Lwt_mutex.create ();
@@ -1419,6 +1826,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) (Sec : Mirage_block.S)
           rebalance_once t;
           scan_alarms t >>= fun () ->
           Hashtbl.iter (fun cell rt -> if rt.store.sql <> None then Lwt.async (fun () -> pump_outbox t cell)) t.runtimes;
+          check_deployments t;
+          shed_if_needed t;
           (* A cell with open sockets is in use, whether or not they talk. *)
           Hashtbl.iter
             (fun cell _ -> Lwt.async (fun () -> serve_cell t ~forwarded:true cell ~meth:"WS" ~path:"/__ws/touch" ~query:[] ~body:"" >|= ignore))

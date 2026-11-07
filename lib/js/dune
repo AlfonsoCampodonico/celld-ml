@@ -2,7 +2,7 @@
 ; 2026-06-04, engine only) and the JS cell runtime binding.
 (library
  (name celld_js)
- (libraries celld_sqlite)
+ (libraries celld_sqlite digestif)
  (foreign_stubs
   (language c)
   (names

@@ -5,7 +5,7 @@
 function fetch(request, ctx) {
   ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS log(id INTEGER PRIMARY KEY, who TEXT, text TEXT)");
   if (request.path === "/ws") {
-    if (request.headers.upgrade !== "websocket") return new Response("expected a websocket upgrade\n", { status: 426 });
+    if (request.headers.get("upgrade") !== "websocket") return new Response("expected a websocket upgrade\n", { status: 426 });
     const [client, server] = Object.values(new WebSocketPair());
     ctx.acceptWebSocket(server, ["room"]);
     server.serializeAttachment({ name: request.query.name || "anon" });

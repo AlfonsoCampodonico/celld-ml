@@ -11,9 +11,17 @@ let call h s ?(meth = "POST") path body =
   if r.wrote then ignore (Store.commit s);
   r
 
+(* JS handlers return steps; nothing here awaits I/O. *)
 let js_cell cell script =
   let s = Store.empty ~sql:true () in
-  match Celld_js.create ~script ~db:(Option.get s.sql) with Ok rt -> (s, Handlers.js rt cell) | Error e -> failwith e
+  match Celld_js.create ~script ~db:(Option.get s.sql) with
+  | Ok rt ->
+      let h = Handlers.js rt cell in
+      let sync : Handlers.handler = fun s ~now_ms ~meth ~path ~query ~body ->
+        match h s ~now_ms ~meth ~path ~query ~body with Handlers.Done r -> r | Handlers.Await _ -> failwith "unexpected await"
+      in
+      (s, sync)
+  | Error e -> failwith e
 
 let contains hay needle =
   let n = String.length needle in

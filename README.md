@@ -181,6 +181,46 @@ claim its cells.
   Every call has an instruction budget and the runtime has a memory limit,
   so a runaway script fails without stalling the node.
   [examples/chat.js](examples/chat.js) is a chat room.
+- **Workers APIs, with I/O.** QuickJS cannot block, so a call that awaits
+  I/O suspends with a list of operations. The node performs them and
+  resumes the call, and one savepoint covers the call across every wait.
+  On top of that, each with a 30 s deadline and at most 50 per call:
+  - **Outbound fetch.** `fetch()` uses `Request`, `Response` and `Headers`
+    with binary bodies. TLS is checked against the Mozilla root store.
+    Hostnames resolve through a built-in DNS client (`--dns`). Cells can
+    never reach the bucket or the peer port, and private addresses are
+    refused unless `--fetch-private` is set.
+  - **Cell stubs.** `ctx.cell("Class:id").fetch(path, init)` calls another
+    cell, Durable Object style, wherever it lives.
+  - **D1.** `ctx.d1(name)` is a SQL database in its own `D1:<name>` cell,
+    with `prepare().bind().all/first/run/raw` and transactional `batch`.
+  - **R2.** `ctx.r2(bucket)` stores objects in the fleet's bucket under
+    `r2/<bucket>/`, with `get/head/put/delete/list` and metadata.
+  - **Workflows.** `ctx.workflow(Class).create({ id, params })` starts a run
+    of the class's `run(event, step, ctx)` in `<Class>:wf-<id>`.
+    `step.do(name, [config], fn)` is memoized, and a failed step rolls back
+    its writes and retries with backoff. `step.sleep` and
+    `step.sleepUntil` suspend the run until its alarm.
+  - **The rest:** timers (`setTimeout`, `setInterval`), `ctx.waitUntil`
+    (finished before the response leaves), `crypto.getRandomValues`,
+    `randomUUID`, `subtle.digest` and HMAC
+    `importKey`/`generateKey`/`sign`/`verify` (from the node's CSPRNG and
+    digestif), `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`,
+    `atob`, `btoa`, `console`, `structuredClone`, `queueMicrotask` and a
+    minimal `ReadableStream`.
+
+  [examples/workers.js](examples/workers.js) tours all of it.
+- **Rolling deploys.** Each resident JS cell records which deployment (the
+  script's etag) it runs. A deploy is announced to the peers, and every
+  node also rechecks the classes of its resident cells. A cell switches to
+  new code before its next event. Calls are serial, so none is in flight
+  then, and the cell keeps its epoch, storage and WebSockets. `/state`
+  shows each cell's deployment.
+- **Memory-pressure and residency shedding.** With `--max-memory-mb` (cell
+  memory: the OCaml heap, SQLite pages and per-cell JS heaps) or
+  `--max-resident-cells`, a node over budget releases its least recently
+  used idle cells. Idle means no socket and no handler running. They
+  reactivate on their next request.
 - **Queues.** A queue is a cell (`Queue:<name>`) holding its messages in
   SQLite. A JS cell sends with `ctx.queue(name).send(body, { delaySeconds })`
   or `sendBatch`. The message goes into the sender's own outbox in the same
@@ -247,10 +287,12 @@ claim its cells.
   bucket stays the root of trust. The protocol version is 6, so nodes
   without peer TLS are not recruited.
 
-Compared with celld, celld-ml still lacks outbound `fetch()` from cells,
-most of the Workers API surface (Web Crypto, streams, `waitUntil`, service
-bindings, D1, R2, Workflows), rolling deploys that move resident cells to
-new code, and memory-pressure shedding.
+Compared with celld, celld-ml lacks the Node.js compatibility layer,
+WebAssembly, HTMLRewriter, the Cache API, Web Crypto beyond random
+values, digests and HMAC, streams beyond a minimal `ReadableStream`, and
+service bindings between Workers (cells reach each other through
+`ctx.cell`). A cell also runs one event at a time, even across awaits;
+celld interleaves at awaits.
 
 ## Layout
 
@@ -356,6 +398,19 @@ dune build @runtest --root . --build-dir _build_all
 - **Peer TLS:** a packet capture of a forwarded write showed 358 packets
   of TLS records on port 8081 and none of the request's plaintext, and a
   takeover recovered the dead owner's log over TLS.
+- **Workers APIs:** with dnsmasq and a small HTTP server on the bridge,
+  these all worked across three nodes: a cell fetched `upstream.test`, was
+  refused the bucket, and computed SHA-256 and a UUID. It also ran D1
+  batches from two cells, stored and listed R2 objects, called a `Counter`
+  and another JS cell through stubs, slept on a timer and finished
+  `waitUntil` work. A workflow waited out its sleep, retried a step that
+  failed on attempt 1, and completed with its memoized results.
+- **Rolling deploy:** a resident cell answered "version 1", the class was
+  redeployed through another node, and the same cell, still at e1,
+  answered "version 2".
+- **Shedding:** with a cap of 6, a node holding 13 cells shed its idle ones
+  down to the cap (alongside rebalancing), and a shed cell answered its
+  next request.
 - **WebSockets:** two clients joined a room through n1 and n2 while n3 owned
   it, so both were relayed over tunnels. Messages reached both, ping and
   close were answered, and draining n3 closed the remaining socket with

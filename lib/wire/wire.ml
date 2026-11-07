@@ -5,12 +5,14 @@ open Celld_logic
 
 (* ---- a JSON just big enough for our records ---- *)
 
-type json = Null | Bool of bool | Int of int | Str of string | Arr of json list | Obj of (string * json) list
+(* [Num] keeps a non-integer number's text exactly (1.5, 1e3). *)
+type json = Null | Bool of bool | Int of int | Num of string | Str of string | Arr of json list | Obj of (string * json) list
 
 let rec to_string = function
   | Null -> "null"
   | Bool b -> string_of_bool b
   | Int n -> string_of_int n
+  | Num s -> s
   | Str s ->
       let b = Buffer.create (String.length s + 2) in
       Buffer.add_char b '"';
@@ -102,8 +104,11 @@ let of_string s =
     | _ ->
         let start = !pos in
         if peek () = '-' then incr pos;
-        while !pos < n && s.[!pos] >= '0' && s.[!pos] <= '9' do incr pos done;
-        (match int_of_string_opt (String.sub s start (!pos - start)) with Some i -> Int i | None -> raise (Bad "number"))
+        while !pos < n && (match s.[!pos] with '0' .. '9' | '.' | 'e' | 'E' | '+' | '-' -> true | _ -> false) do incr pos done;
+        let text = String.sub s start (!pos - start) in
+        (match int_of_string_opt text with
+        | Some i -> Int i
+        | None -> (match float_of_string_opt text with Some _ when text <> "" -> Num text | _ -> raise (Bad "number")))
   in
   match value () with v -> Ok v | exception Bad e -> Error e | exception _ -> Error "malformed json"
 

@@ -266,4 +266,15 @@ let () =
   feed b2 (Output_at { req = r; position = None });
   check "b2 takes the drained cell without recovery, at e3" (res = Ok (Local 3));
 
+  (* Evict: memory pressure releases a quiet cell, with no handoff. *)
+  let r, res = request b2 "Kv:hot" in
+  feed b2 (Output_at { req = r; position = None });
+  check "b2 holds Kv:hot" (res = Ok (Local 1));
+  feed b2 (Evict [ "Kv:hot" ]);
+  advance 1_000;
+  check "evicted cell released" (owner "Kv:hot" = (None, 1));
+  let r, res = request b2 "Kv:hot" in
+  feed b2 (Output_at { req = r; position = None });
+  check "and reactivates on its next request" (res = Ok (Local 2));
+
   Printf.printf "%d checks passed\n" !pass

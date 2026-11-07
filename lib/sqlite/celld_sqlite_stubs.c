@@ -420,3 +420,17 @@ CAMLprim value celld_sql_finalize(value s) {
   Stmt_val(s) = NULL;
   return Val_unit;
 }
+
+/* ---- binding parameters, for D1 ---- */
+
+CAMLprim value celld_sql_bind_null(value s, value i) { return Val_bool(sqlite3_bind_null(Stmt_val(s), Int_val(i)) == SQLITE_OK); }
+CAMLprim value celld_sql_bind_int64(value s, value i, value v) { return Val_bool(sqlite3_bind_int64(Stmt_val(s), Int_val(i), Int64_val(v)) == SQLITE_OK); }
+CAMLprim value celld_sql_bind_double(value s, value i, value v) { return Val_bool(sqlite3_bind_double(Stmt_val(s), Int_val(i), Double_val(v)) == SQLITE_OK); }
+CAMLprim value celld_sql_bind_text(value s, value i, value v) {
+  return Val_bool(sqlite3_bind_text(Stmt_val(s), Int_val(i), String_val(v), (int)caml_string_length(v), SQLITE_TRANSIENT) == SQLITE_OK);
+}
+/* 1 integer, 2 float, 3 text, 4 blob, 5 null */
+CAMLprim value celld_sql_column_type(value s, value i) { return Val_int(sqlite3_column_type(Stmt_val(s), Int_val(i))); }
+CAMLprim value celld_sql_bind_count(value s) { return Val_int(sqlite3_bind_parameter_count(Stmt_val(s))); }
+CAMLprim value celld_sql_changes(value v) { return Val_int(sqlite3_changes(conn_of(v)->db)); }
+CAMLprim value celld_sql_last_rowid(value v) { return caml_copy_int64(sqlite3_last_insert_rowid(conn_of(v)->db)); }

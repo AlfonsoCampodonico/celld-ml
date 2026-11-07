@@ -68,6 +68,9 @@ type event =
   (* moving cells between nodes *)
   | Shed of { cells : cell_id list; target : peer }
       (** Hand these resident cells to [target] once they go quiet. *)
+  | Evict of cell_id list
+      (** Release these resident cells once quiet, with no handoff: memory
+          pressure or the residency cap. *)
   | Drain of peer list
       (** Stop taking ownership, hand every cell to these peers, then retire
           the lease and exit. *)

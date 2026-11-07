@@ -338,12 +338,60 @@ let valid_cell id =
   n > 0 && n <= 255 && id <> "." && id <> ".."
   && String.for_all (function 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' | '.' | ':' | '$' | '-' -> true | _ -> false) id
 
+(* ---- D1: a SQL database cell for JS bindings ----
+   ctx.d1(name) reaches D1:<name> through the node. POST /__d1 runs
+   {"stmts":[{"sql","params"}], "batch"} with bound parameters; a batch is
+   one transaction. The rest is the Sql: class. *)
+
+let d1 (s : Store.t) ~meth ~path ~query ~body =
+  match s.sql, meth, path with
+  | Some db, "POST", "/__d1" -> (
+      let stmts = rows s (Printf.sprintf "SELECT json_extract(value, '$.sql'), value -> '$.params' FROM json_each(%s, '$.stmts')" (q body)) in
+      let batch = scalar s (Printf.sprintf "SELECT json_extract(%s, '$.batch')" (q body)) = Some "1" in
+      let params p =
+        List.map
+          (function
+            | [ Some "integer"; Some v ] -> Celld_sqlite.Int (Int64.of_string v)
+            | [ Some "real"; Some v ] -> Celld_sqlite.Float (float_of_string v)
+            | [ Some "true"; _ ] -> Celld_sqlite.Int 1L
+            | [ Some "false"; _ ] -> Celld_sqlite.Int 0L
+            | [ Some "null"; _ ] | [ _; None ] -> Celld_sqlite.Null
+            | [ _; Some v ] -> Celld_sqlite.Text v
+            | _ -> Celld_sqlite.Null)
+          (rows s (Printf.sprintf "SELECT type, value FROM json_each(%s)" (q p)))
+      in
+      let jv = function
+        | Celld_sqlite.V_null -> "null"
+        | V_int v | V_float v -> v
+        | V_text v -> json_str v
+      in
+      if batch then ignore (Celld_sqlite.exec db "SAVEPOINT celld_d1");
+      let rec go acc = function
+        | [] -> Ok (List.rev acc)
+        | [ Some sql; p ] :: rest -> (
+            match Celld_sqlite.exec_bound db sql (match p with Some p -> params p | None -> []) with
+            | Error e -> Error e
+            | Ok (cols, rs, changes, rowid) ->
+                let row r = "{" ^ String.concat "," (List.map2 (fun c v -> json_str c ^ ":" ^ jv v) cols r) ^ "}" in
+                go (Printf.sprintf "{\"rows\":[%s],\"meta\":{\"changes\":%d,\"last_row_id\":%Ld}}" (String.concat "," (List.map row rs)) changes rowid :: acc) rest)
+        | _ :: _ -> Error "bad statement"
+      in
+      match go [] stmts with
+      | Ok results ->
+          if batch then ignore (Celld_sqlite.exec db "RELEASE celld_d1");
+          { status = 200; body = "[" ^ String.concat "," results ^ "]"; wrote = Store.changed s; content_type = "application/json"; effects = "" }
+      | Error e ->
+          if batch then ignore (Celld_sqlite.exec db "ROLLBACK TO celld_d1; RELEASE celld_d1");
+          err 400 (e ^ "\n"))
+  | _ -> sql s ~meth ~path ~query ~body
+
 let dispatch cell : handler option =
   match class_of cell with
   | "Counter" -> Some (with_alarm counter_alarm counter)
   | "Kv" -> Some (with_alarm kv_alarm kv)
   | "Sql" -> Some (with_alarm sql_alarm sql)
   | "Queue" -> Some (queue_cell cell)
+  | "D1" -> Some (with_alarm sql_alarm d1)
   | _ -> None
 
 (* ---- JS classes ----
@@ -352,7 +400,7 @@ let dispatch cell : handler option =
    call runs inside a savepoint: a handler that throws leaves no writes. *)
 
 let is_js cell = String.contains cell ':' && dispatch cell = None
-let is_sql cell = class_of cell = "Sql" || class_of cell = "Queue" || is_js cell
+let is_sql cell = List.mem (class_of cell) [ "Sql"; "Queue"; "D1" ] || is_js cell
 
 let valid_class c =
   let n = String.length c in
@@ -401,78 +449,158 @@ let cron_reschedule s ~now_ms =
   in
   match times with [] -> Store.meta_remove s "alarm" | t :: r -> Store.meta_set s "alarm" (string_of_int (List.fold_left min t r))
 
-(* A runtime-dispatched call whose user handler threw comes back as a 5xx:
-   its writes are rolled back like a thrown fetch. *)
-let guarded s f =
-  in_savepoint s (fun () ->
-      match f () with
-      | Ok (r : Celld_js.response) when r.status >= 500 -> Error r
-      | Ok r -> Ok r
-      | Error e -> Error { Celld_js.status = 500; content_type = "text/plain"; body = e; effects = "" })
+(* ---- JS cells: calls that may wait for I/O ----
+   A JS call either replies or awaits operations (fetch, cell calls, D1, R2,
+   timers, workflows) that the node performs; [Await (ops, k)] resumes it
+   with their results. One savepoint covers the whole call, across every
+   wait, so a handler that throws leaves no writes. *)
 
-let js (rt : Celld_js.t) cell : handler =
-  let call ~name body = Celld_js.call rt ~name ~cell ~meth:"" ~path:"" ~query:[] ~body in
+type step = Done of reply | Await of string * (string -> step)
+
+type async_handler =
+  Store.t -> now_ms:int -> meth:string -> path:string -> query:(string * string) list -> body:string -> step
+
+let reply_of_js ?(content_type = "") s (r : Celld_js.response) =
+  { status = r.status; body = r.body; wrote = Store.changed s; content_type = (if content_type = "" then Celld_js.content_type r else content_type); effects = r.effects }
+
+(* Run one JS call to completion. [strict]: a 5xx from a runtime-dispatched
+   handler (scheduled, queue) means it threw. *)
+let js_call s rt ~strict ~name ~cell ~meth ~path ~query ~body (k : (Celld_js.response, Celld_js.response) result -> step) : step =
+  let sp q = match s.Store.sql with Some db -> ignore (Celld_sqlite.exec db q) | None -> () in
+  sp "SAVEPOINT celld_req";
+  let finish res =
+    (match res with Ok _ -> sp "RELEASE celld_req" | Error _ -> sp "ROLLBACK TO celld_req; RELEASE celld_req");
+    k res
+  in
+  let rec go = function
+    | Ok (Celld_js.Reply r) -> if strict && r.status >= 500 then finish (Error r) else finish (Ok r)
+    | Ok (Celld_js.Await ops) -> Await (ops, fun results -> go (Celld_js.resume rt results))
+    | Error e -> finish (Error { Celld_js.status = 500; headers = [ ("content-type", "text/plain") ]; body = e; effects = "" })
+  in
+  go (Celld_js.call rt ~name ~cell ~meth ~path ~query ~body)
+
+let is_wf_cell cell = match String.index_opt cell ':' with Some i -> String.length cell > i + 4 && String.sub cell (i + 1) 3 = "wf-" | None -> false
+
+let jx s json path = scalar s (Printf.sprintf "SELECT json_extract(%s, %s)" (q json) (q path))
+let jraw s json path = scalar s (Printf.sprintf "SELECT %s -> %s" (q json) (q path))
+
+let js (rt : Celld_js.t) cell : async_handler =
+  let fired s = Done { (ok "fired\n") with wrote = Store.changed s } in
+  (* cron: run each due expression in turn, then re-arm *)
   let cron_tick s ~now_ms =
-    List.iter
-      (fun (e, t) ->
-        let run occ fails =
-          match guarded s (fun () -> call ~name:"scheduled" (Printf.sprintf "{\"cron\":%s,\"scheduledTime\":%d}" (json_str e) occ)) with
-          | Ok _ ->
-              Store.meta_set s ("cron_last:" ^ e) (string_of_int occ);
-              Store.meta_remove s ("cron_retry:" ^ e)
-          | Error r ->
-              let no_retry =
-                let n = "\"noRetry\":true" in
-                let rec has i = i + String.length n <= String.length r.body && (String.sub r.body i (String.length n) = n || has (i + 1)) in
-                has 0
-              in
-              let fails = fails + 1 in
-              let retry_at = now_ms + (4000 * (1 lsl (fails - 1))) in
-              let past_next = match Celld_cron.next t ~after_ms:occ with Some n -> retry_at >= n | None -> false in
-              prerr_endline (Printf.sprintf "cron %s of %s failed (attempt %d)" e cell fails);
-              if no_retry || fails >= 6 || past_next then begin
-                Store.meta_set s ("cron_last:" ^ e) (string_of_int occ);
-                Store.meta_remove s ("cron_retry:" ^ e)
-              end
-              else Store.meta_set s ("cron_retry:" ^ e) (Printf.sprintf "%d,%d,%d" occ fails retry_at)
+    let rec each = function
+      | [] -> cron_reschedule s ~now_ms; fired s
+      | (e, t) :: rest -> (
+          let run occ fails =
+            js_call s rt ~strict:true ~name:"scheduled" ~cell ~meth:"" ~path:"" ~query:[]
+              ~body:(Printf.sprintf "{\"cron\":%s,\"scheduledTime\":%d}" (json_str e) occ)
+              (fun res ->
+                (match res with
+                | Ok _ ->
+                    Store.meta_set s ("cron_last:" ^ e) (string_of_int occ);
+                    Store.meta_remove s ("cron_retry:" ^ e)
+                | Error r ->
+                    let no_retry = jx s r.body "$.noRetry" = Some "1" in
+                    let fails = fails + 1 in
+                    let retry_at = now_ms + (4000 * (1 lsl (fails - 1))) in
+                    let past_next = match Celld_cron.next t ~after_ms:occ with Some n -> retry_at >= n | None -> false in
+                    prerr_endline (Printf.sprintf "cron %s of %s failed (attempt %d)" e cell fails);
+                    if no_retry || fails >= 6 || past_next then begin
+                      Store.meta_set s ("cron_last:" ^ e) (string_of_int occ);
+                      Store.meta_remove s ("cron_retry:" ^ e)
+                    end
+                    else Store.meta_set s ("cron_retry:" ^ e) (Printf.sprintf "%d,%d,%d" occ fails retry_at));
+                each rest)
+          in
+          match cron_retry s e with
+          | Some (occ, fails, at) when at <= now_ms -> (
+              match Celld_cron.latest_due t ~after_ms:occ ~at_ms:now_ms with Some newer -> run newer 0 | None -> run occ fails)
+          | Some _ -> each rest
+          | None -> (
+              let last = Option.value (meta_int s ("cron_last:" ^ e)) ~default:now_ms in
+              match Celld_cron.latest_due t ~after_ms:last ~at_ms:now_ms with Some occ -> run occ 0 | None -> each rest))
+    in
+    each (cron_exprs s)
+  in
+  (* workflows: each alarm runs the instance from the top; finished steps
+     come back from storage, and a sleep or a retry suspends it again *)
+  let wf_status s =
+    Printf.sprintf "{\"id\":%s,\"status\":%s,\"output\":%s,\"error\":%s}"
+      (json_str cell)
+      (json_str (Option.value (Store.meta_get s "wf_status") ~default:"unknown"))
+      (Option.value (Store.meta_get s "wf_output") ~default:"null")
+      (match Store.meta_get s "wf_error" with Some e -> json_str e | None -> "null")
+  in
+  let wf_run s ~now_ms =
+    match Store.meta_get s "wf_status" with
+    | Some ("queued" | "waiting" | "running") ->
+        Store.meta_set s "wf_status" "running";
+        let input =
+          Printf.sprintf "{\"id\":%s,\"params\":%s,\"created\":%s}" (json_str cell)
+            (Option.value (Store.meta_get s "wf_params") ~default:"null")
+            (Option.value (Store.meta_get s "wf_created") ~default:"0")
         in
-        match cron_retry s e with
-        | Some (occ, fails, at) when at <= now_ms -> (
-            (* the next occurrence never waits for a retry *)
-            match Celld_cron.latest_due t ~after_ms:occ ~at_ms:now_ms with Some newer -> run newer 0 | None -> run occ fails)
-        | Some _ -> ()
-        | None -> (
-            let last = Option.value (meta_int s ("cron_last:" ^ e)) ~default:now_ms in
-            match Celld_cron.latest_due t ~after_ms:last ~at_ms:now_ms with Some occ -> run occ 0 | None -> ()))
-      (cron_exprs s);
-    cron_reschedule s ~now_ms
+        js_call s rt ~strict:false ~name:"workflow" ~cell ~meth:"" ~path:"" ~query:[] ~body:input (fun res ->
+            (match res with
+            | Ok r -> (
+                match jx s r.body "$.status" with
+                | Some "complete" ->
+                    Store.meta_set s "wf_status" "complete";
+                    Store.meta_set s "wf_output" (Option.value (jraw s r.body "$.output") ~default:"null")
+                | Some "waiting" ->
+                    Store.meta_set s "wf_status" "waiting";
+                    Store.meta_set s "alarm" (Option.value (jx s r.body "$.wake") ~default:(string_of_int (now_ms + 1000)))
+                | _ ->
+                    Store.meta_set s "wf_status" "errored";
+                    Store.meta_set s "wf_error" (Option.value (jx s r.body "$.error") ~default:"unknown error"))
+            | Error r ->
+                Store.meta_set s "wf_status" "errored";
+                Store.meta_set s "wf_error" r.body);
+            fired s)
+    | _ -> fired s
   in
-  let on_alarm s ~now_ms =
-    if is_cron_cell cell then cron_tick s ~now_ms
-    else match guarded s (fun () -> call ~name:"alarm" "") with Ok _ -> () | Error r -> prerr_endline ("alarm handler failed for " ^ cell ^ ": " ^ r.body)
-  in
-  with_outbox
-    (with_alarm on_alarm (fun s ~meth ~path ~query ~body ->
-         let now_ms = Option.value (scalar_int s "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)") ~default:0 in
-         match meth, path with
-         | "CRON", "/__cron/arm" when is_cron_cell cell ->
-             let exprs = List.filter (fun e -> String.trim e <> "") (List.map String.trim (String.split_on_char '\n' body)) in
-             Store.meta_set s "crons" (String.concat "\n" exprs);
-             (* a new schedule starts now: no backfill *)
-             List.iter (fun e -> if meta_int s ("cron_last:" ^ e) = None then Store.meta_set s ("cron_last:" ^ e) (string_of_int now_ms)) exprs;
-             cron_reschedule s ~now_ms;
-             { (ok (Printf.sprintf "armed %d schedules\n" (List.length exprs))) with wrote = Store.changed s }
-         | "WS", "/__ws/touch" -> ok "ok\n"
-         | "WS", (("/__ws/message" | "/__ws/close") as p) -> (
-             let name = if p = "/__ws/message" then "ws_message" else "ws_close" in
-             match in_savepoint s (fun () -> Celld_js.call rt ~name ~cell ~meth:"" ~path:"" ~query:[] ~body) with
-             | Ok r -> { (ok "") with wrote = Store.changed s; effects = r.effects }
-             | Error e -> err 500 ("uncaught exception: " ^ e ^ "\n"))
-         | "QUEUE", "/__queue/deliver" -> (
-             match guarded s (fun () -> call ~name:"queue" body) with
-             | Ok r -> { status = 200; body = r.body; wrote = Store.changed s; content_type = "application/json"; effects = "" }
-             | Error r -> { status = 500; body = r.body; wrote = Store.changed s; content_type = "application/json"; effects = "" })
-         | _ -> (
-             match in_savepoint s (fun () -> Celld_js.call rt ~name:"fetch" ~cell ~meth ~path ~query ~body) with
-             | Ok r -> { status = r.status; body = r.body; wrote = Store.changed s; content_type = r.content_type; effects = r.effects }
-             | Error e -> err 500 ("uncaught exception: " ^ e ^ "\n"))))
+  fun s ~now_ms ~meth ~path ~query ~body ->
+    match meth, path with
+    | ("GET" | "PUT" | "DELETE"), "/__alarm" -> Done (with_alarm (fun _ ~now_ms:_ -> ()) (fun _ ~meth:_ ~path:_ ~query:_ ~body:_ -> err 404 "") s ~now_ms ~meth ~path ~query ~body)
+    | "ALARM", "/__alarm/fire" -> (
+        match alarm_of s with
+        | Some at when at <= now_ms ->
+            Store.meta_remove s "alarm";
+            if is_cron_cell cell then cron_tick s ~now_ms
+            else if is_wf_cell cell then wf_run s ~now_ms
+            else js_call s rt ~strict:true ~name:"alarm" ~cell ~meth:"" ~path:"" ~query:[] ~body:"" (fun res ->
+                (match res with Error r -> prerr_endline ("alarm handler failed for " ^ cell ^ ": " ^ r.body) | Ok _ -> ());
+                match res with Ok r | Error r -> Done { (ok "fired\n") with wrote = Store.changed s; effects = r.effects })
+        | _ -> Done (ok "not due\n"))
+    | "OUTBOX", "/__outbox/ack" -> Done (with_outbox (fun _ ~now_ms:_ ~meth:_ ~path:_ ~query:_ ~body:_ -> err 404 "") s ~now_ms ~meth ~path ~query ~body)
+    | "CRON", "/__cron/arm" when is_cron_cell cell ->
+        let exprs = List.filter (fun e -> String.trim e <> "") (List.map String.trim (String.split_on_char '\n' body)) in
+        Store.meta_set s "crons" (String.concat "\n" exprs);
+        (* a new schedule starts now: no backfill *)
+        List.iter (fun e -> if meta_int s ("cron_last:" ^ e) = None then Store.meta_set s ("cron_last:" ^ e) (string_of_int now_ms)) exprs;
+        cron_reschedule s ~now_ms;
+        Done { (ok (Printf.sprintf "armed %d schedules\n" (List.length exprs))) with wrote = Store.changed s }
+    | "WORKFLOW", "/__wf/create" when is_wf_cell cell ->
+        if Store.meta_get s "wf_status" = None then begin
+          Store.meta_set s "wf_params" (Option.value (jraw s body "$.params") ~default:"null");
+          Store.meta_set s "wf_created" (string_of_int now_ms);
+          Store.meta_set s "wf_status" "queued";
+          Store.meta_set s "alarm" (string_of_int now_ms)
+        end;
+        Done { status = 200; body = wf_status s; wrote = Store.changed s; content_type = "application/json"; effects = "" }
+    | "WORKFLOW", "/__wf/status" when is_wf_cell cell ->
+        Done { status = 200; body = wf_status s; wrote = false; content_type = "application/json"; effects = "" }
+    | "WS", "/__ws/touch" -> Done (ok "ok\n")
+    | "WS", (("/__ws/message" | "/__ws/close") as p) ->
+        let name = if p = "/__ws/message" then "ws_message" else "ws_close" in
+        js_call s rt ~strict:false ~name ~cell ~meth:"" ~path:"" ~query:[] ~body (function
+          | Ok r -> Done { (ok "") with wrote = Store.changed s; effects = r.effects }
+          | Error r -> Done (err 500 ("uncaught exception: " ^ r.body ^ "\n")))
+    | "QUEUE", "/__queue/deliver" ->
+        js_call s rt ~strict:true ~name:"queue" ~cell ~meth:"" ~path:"" ~query:[] ~body (function
+          | Ok r -> Done (reply_of_js ~content_type:"application/json" s r)
+          | Error r -> Done { (reply_of_js ~content_type:"application/json" s r) with status = 500 })
+    | _ ->
+        js_call s rt ~strict:false ~name:"fetch" ~cell ~meth ~path ~query ~body (function
+          | Ok r -> Done (reply_of_js s r)
+          | Error r -> Done (err 500 ("uncaught exception: " ^ r.body ^ "\n")))

@@ -19,16 +19,16 @@ let () =
   match Celld_js.create ~script ~db with
   | Error e -> check ("create: " ^ e) false
   | Ok js ->
-      let call ?(meth = "GET") path = Celld_js.call js ~name:"fetch" ~cell:"Hits:a" ~meth ~path ~query:[] ~body:"" in
+      let call ?(meth = "GET") path = Celld_js.call_sync js ~name:"fetch" ~cell:"Hits:a" ~meth ~path ~query:[] ~body:"" in
       (match call ~meth:"POST" "/x" with
-      | Ok r -> check "fetch returns JSON" (r.status = 200 && r.content_type = "application/json" && r.body = {|{"cell":"Hits:a","hits":1}|})
+      | Ok r -> check "fetch returns JSON" (r.status = 200 && Celld_js.content_type r = "application/json" && r.body = {|{"cell":"Hits:a","hits":1}|})
       | Error e -> check ("fetch: " ^ e) false);
       check "storage writes dirty the database" (snd (Celld_sqlite.dirty db) <> []);
       (match call "/boom" with Error e -> check "exceptions surface" (String.length e >= 4 && String.sub e 0 11 = "Error: boom") | Ok _ -> check "exceptions surface" false);
       (match call "/spin" with Error e -> check ("runaway script interrupted: " ^ String.sub e 0 (min 30 (String.length e))) true | Ok _ -> check "runaway script interrupted" false);
       (match call "/kv" with Ok r -> check "kv storage" (r.body = "1") | Error e -> check e false);
       (match call "/kv" with Ok r -> check "kv storage persists" (r.body = "2") | Error e -> check e false);
-      (match Celld_js.call js ~name:"alarm" ~cell:"Hits:a" ~meth:"" ~path:"" ~query:[] ~body:"" with
+      (match Celld_js.call_sync js ~name:"alarm" ~cell:"Hits:a" ~meth:"" ~path:"" ~query:[] ~body:"" with
       | Ok _ -> check "async alarm" (match call "/kv" with Ok _ -> true | Error _ -> false)
       | Error e -> check e false);
       (match Celld_js.create ~script:"syntax error here (" ~db with Error _ -> check "bad script rejected" true | Ok _ -> check "bad script rejected" false);
@@ -45,8 +45,8 @@ let () =
     if (r.path === "/hog") { const xs = []; for (;;) xs.push(new Array(100000).fill(1)); }
     if (r.path === "/json") return String(JSON.parse(r.query.s).length);
     return "b"; }|} in
-  let call t ?(query = []) path = Celld_js.call t ~name:"fetch" ~cell:"X:1" ~meth:"GET" ~path ~query ~body:"" in
-  check "cells keep separate globals" (call a "/" = Ok { status = 200; content_type = "text/plain"; body = "1"; effects = "" } && (match call b "/" with Ok r -> r.body = "b" | _ -> false));
+  let call t ?(query = []) path = Celld_js.call_sync t ~name:"fetch" ~cell:"X:1" ~meth:"GET" ~path ~query ~body:"" in
+  check "cells keep separate globals" ((match call a "/" with Ok r -> r.status = 200 && r.body = "1" | _ -> false) && (match call b "/" with Ok r -> r.body = "b" | _ -> false));
   (match call b "/deep" with Error e -> check ("deep recursion is an error: " ^ String.sub e 0 (min 40 (String.length e))) true | Ok _ -> check "deep recursion" false);
   (match call b "/hog" with Error _ -> check "memory limit is per cell" true | Ok _ -> check "memory limit" false);
   check "other cell unaffected by a hog" (match call a "/" with Ok r -> r.body = "2" | _ -> false);
@@ -65,7 +65,7 @@ let () =
     | Ok t -> t
     | Error e -> failwith e
   in
-  let call () = Celld_js.call t ~name:"fetch" ~cell:"X:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" in
+  let call () = Celld_js.call_sync t ~name:"fetch" ~cell:"X:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" in
   (match call () with Error _ -> check "endless promise chain is cut off" true | Ok _ -> check "endless promise chain" false);
   check "context is poisoned" (Celld_js.poisoned t);
   (match call () with Error e -> check "poisoned context refuses calls" (String.sub e 0 8 = "poisoned") | Ok _ -> check "poisoned" false);
@@ -79,7 +79,7 @@ let () =
       Celld_js.create ~db
         ~script:
           {|function fetch(request, ctx) {
-              if (request.headers.upgrade !== "websocket") return new Response("expected a websocket", { status: 426 });
+              if (request.headers.get("upgrade") !== "websocket") return new Response("expected a websocket", { status: 426 });
               const [client, server] = Object.values(new WebSocketPair());
               ctx.acceptWebSocket(server, ["room"]);
               server.serializeAttachment({ joined: 1 });
@@ -94,7 +94,7 @@ let () =
     | Error e -> failwith e
   in
   Celld_js.headers := [ ("Upgrade", "websocket") ];
-  let r = Celld_js.call t ~name:"fetch" ~cell:"Room:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" in
+  let r = Celld_js.call_sync t ~name:"fetch" ~cell:"Room:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" in
   Celld_js.headers := [];
   match r with
   | Error e -> check ("upgrade: " ^ e) false
@@ -102,10 +102,56 @@ let () =
       check "fetch accepts a socket with a 101" (r.status = 101 && String.length r.effects > 0 && String.sub r.effects 0 11 = {|{"accept":[|});
       let id = String.sub r.effects 12 24 in
       Celld_js.sockets := [ id ];
-      (match Celld_js.call t ~name:"ws_message" ~cell:"Room:1" ~meth:"" ~path:"" ~query:[] ~body:(Printf.sprintf {|{"id":%S,"data":"hi","binary":false}|} id) with
+      (match Celld_js.call_sync t ~name:"ws_message" ~cell:"Room:1" ~meth:"" ~path:"" ~query:[] ~body:(Printf.sprintf {|{"id":%S,"data":"hi","binary":false}|} id) with
       | Ok m -> check "a message is broadcast to tagged sockets" (m.effects = Printf.sprintf {|{"accept":[],"sends":[{"id":%S,"data":"echo:hi:1","binary":false}],"closes":[]}|} id)
       | Error e -> check e false);
-      (match Celld_js.call t ~name:"ws_close" ~cell:"Room:1" ~meth:"" ~path:"" ~query:[] ~body:(Printf.sprintf {|{"id":%S,"code":1000,"reason":""}|} id) with
+      (match Celld_js.call_sync t ~name:"ws_close" ~cell:"Room:1" ~meth:"" ~path:"" ~query:[] ~body:(Printf.sprintf {|{"id":%S,"code":1000,"reason":""}|} id) with
       | Ok _ -> check "close runs webSocketClose" true
       | Error e -> check e false);
       Celld_js.sockets := []
+
+(* Suspension: a fetch hands the node an operation and resumes with its
+   result; Web Crypto, URL and encoders. *)
+let () =
+  let db = Celld_sqlite.open_image "" in
+  let t =
+    match
+      Celld_js.create ~db
+        ~script:
+          {|async function fetch(request, ctx) {
+              if (request.path === "/out") {
+                const r = await fetch("https://example.test/data?x=1", { method: "POST", body: "ping" });
+                return new Response("upstream said " + r.status + " " + (await r.text()) + " " + r.headers.get("x-up"));
+              }
+              const h = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("abc")));
+              const hex = Array.from(h, (b) => b.toString(16).padStart(2, "0")).join("");
+              const key = await crypto.subtle.importKey("raw", new TextEncoder().encode("key"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+              const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode("The quick brown fox jumps over the lazy dog")));
+              const u = new URL("https://a.b:8443/p/q?x=1&y=two#h");
+              return Response.json({ hex, mac: Array.from(mac, (b) => b.toString(16).padStart(2, "0")).join(""),
+                uuid: crypto.randomUUID().length, host: u.host, y: u.searchParams.get("y"),
+                text: new TextDecoder().decode(new TextEncoder().encode("héllo ✓")), b64: btoa("hi"), un: atob("aGk=") });
+            }|}
+    with
+    | Ok t -> t
+    | Error e -> failwith e
+  in
+  (match Celld_js.call_sync t ~name:"fetch" ~cell:"C:1" ~meth:"GET" ~path:"/" ~query:[] ~body:"" with
+  | Ok r ->
+      let has k = let n = String.length k in let rec go i = i + n <= String.length r.body && (String.sub r.body i n = k || go (i + 1)) in go 0 in
+      check "SHA-256 digest" (has "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+      check "HMAC-SHA256" (has "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8");
+      check "URL and URLSearchParams" (has {|"host":"a.b:8443","y":"two"|});
+      check "TextEncoder/TextDecoder round trip" (has "héllo ✓");
+      check "btoa/atob and randomUUID" (has {|"b64":"aGk=","un":"hi"|} && has {|"uuid":36|})
+  | Error e -> check e false);
+  match Celld_js.call t ~name:"fetch" ~cell:"C:1" ~meth:"GET" ~path:"/out" ~query:[] ~body:"" with
+  | Ok (Celld_js.Await ops) ->
+      check "fetch suspends with an operation" (String.length ops > 0 && String.length ops > 10);
+      let body = Celld_js.base64 "pong" in
+      (match Celld_js.resume t (Printf.sprintf {|[{"_op":1,"value":{"status":201,"headers":{"x-up":"yes"},"body":"%s"}}]|} body) with
+      | Ok (Celld_js.Reply r) -> check "resume completes the call" (r.body = "upstream said 201 pong yes")
+      | Ok (Celld_js.Await _) -> check "resume completes the call" false
+      | Error e -> check e false)
+  | Ok (Celld_js.Reply _) -> check "fetch suspends" false
+  | Error e -> check e false

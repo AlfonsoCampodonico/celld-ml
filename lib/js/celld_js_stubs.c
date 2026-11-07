@@ -20,6 +20,7 @@
 #include <caml/memory.h>
 #include <caml/custom.h>
 #include <caml/fail.h>
+#include <caml/callback.h>
 
 extern sqlite3 *celld_sql_handle(value conn);
 extern void celld_sql_reset_budget(void);
@@ -35,6 +36,7 @@ struct cell {
   sqlite3 *db;  /* NULL once disposed */
   int budget;
   int poisoned; /* jobs were left queued: the context must be rebuilt */
+  JSValue pending; /* the dispatch promise of a suspended call, or undefined */
 };
 
 /* Allocator with a size header, so the memory limit counts real bytes on
@@ -112,6 +114,8 @@ static int drain(struct cell *c, JSContext **failed) {
 
 static void cell_free(struct cell *c) {
   c->db = NULL;
+  if (c->ctx && !JS_IsUndefined(c->pending)) JS_FreeValue(c->ctx, c->pending);
+  c->pending = JS_UNDEFINED;
   if (c->ctx) {
     JS_SetContextOpaque(c->ctx, NULL);
     JS_FreeContext(c->ctx);
@@ -230,6 +234,98 @@ static JSValue js_sql_exec(JSContext *ctx, JSValueConst this_val, int argc, JSVa
   return rows;
 }
 
+/* ---- natives backed by OCaml (registered with Callback.register) ---- */
+
+/* The bytes of an ArrayBuffer, a typed array or DataView, or a string
+   (UTF-8). [*free_str] is set when the result must go to JS_FreeCString. */
+static const uint8_t *bytes_of(JSContext *ctx, JSValueConst v, size_t *len, const char **free_str) {
+  *free_str = NULL;
+  size_t n;
+  uint8_t *p = JS_GetArrayBuffer(ctx, &n, v);
+  if (p) { *len = n; return p; }
+  JS_FreeValue(ctx, JS_GetException(ctx));
+  size_t off, blen, bpe;
+  JSValue ab = JS_GetTypedArrayBuffer(ctx, v, &off, &blen, &bpe);
+  if (!JS_IsException(ab)) {
+    p = JS_GetArrayBuffer(ctx, &n, ab);
+    JS_FreeValue(ctx, ab);
+    if (p) { *len = blen; return p + off; }
+  }
+  JS_FreeValue(ctx, JS_GetException(ctx));
+  const char *s = JS_ToCStringLen(ctx, len, v);
+  *free_str = s;
+  return (const uint8_t *)s;
+}
+
+static value ocaml_bytes(const uint8_t *p, size_t n) { return caml_alloc_initialized_string(n, (const char *)p); }
+
+static JSValue js_log(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  const value *f = caml_named_value("celld_js_log");
+  if (!f || argc < 2) return JS_UNDEFINED;
+  size_t n;
+  const char *s = JS_ToCStringLen(ctx, &n, argv[1]);
+  const char *lvl = JS_ToCString(ctx, argv[0]);
+  if (s && lvl) {
+    CAMLparam0();
+    CAMLlocal2(a, b);
+    a = caml_copy_string(lvl);
+    b = ocaml_bytes((const uint8_t *)s, n);
+    caml_callback2(*f, a, b);
+    CAMLdrop;
+  }
+  if (s) JS_FreeCString(ctx, s);
+  if (lvl) JS_FreeCString(ctx, lvl);
+  return JS_UNDEFINED;
+}
+
+/* __celld_random(n) -> ArrayBuffer of n bytes from the node's CSPRNG. */
+static JSValue js_random(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  int64_t n = 0;
+  if (argc < 1 || JS_ToInt64(ctx, &n, argv[0]) || n < 0 || n > 65536) return JS_ThrowRangeError(ctx, "at most 65536 random bytes");
+  const value *f = caml_named_value("celld_js_random");
+  if (!f) return JS_ThrowTypeError(ctx, "no random source");
+  CAMLparam0();
+  CAMLlocal1(r);
+  r = caml_callback(*f, Val_long(n));
+  JSValue out = JS_NewArrayBufferCopy(ctx, (const uint8_t *)String_val(r), caml_string_length(r));
+  CAMLdrop;
+  return out;
+}
+
+/* __celld_digest(alg, data) and __celld_hmac(alg, key, data) -> ArrayBuffer.
+   An empty result means an unknown algorithm. */
+static JSValue js_hash(JSContext *ctx, int argc, JSValueConst *argv, int hmac) {
+  if (argc < (hmac ? 3 : 2)) return JS_ThrowTypeError(ctx, "missing arguments");
+  const value *f = caml_named_value(hmac ? "celld_js_hmac" : "celld_js_digest");
+  if (!f) return JS_ThrowTypeError(ctx, "no digest support");
+  const char *alg = JS_ToCString(ctx, argv[0]);
+  if (!alg) return JS_EXCEPTION;
+  size_t kl = 0, dl;
+  const char *kf = NULL, *df;
+  const uint8_t *k = hmac ? bytes_of(ctx, argv[1], &kl, &kf) : NULL;
+  const uint8_t *d = bytes_of(ctx, argv[hmac ? 2 : 1], &dl, &df);
+  JSValue out;
+  {
+    CAMLparam0();
+    CAMLlocal4(a, kb, db, r);
+    a = caml_copy_string(alg);
+    db = ocaml_bytes(d ? d : (const uint8_t *)"", d ? dl : 0);
+    if (hmac) { kb = ocaml_bytes(k ? k : (const uint8_t *)"", k ? kl : 0); r = caml_callback3(*f, a, kb, db); }
+    else r = caml_callback2(*f, a, db);
+    if (caml_string_length(r) == 0) out = JS_ThrowTypeError(ctx, "unsupported algorithm %s", alg);
+    else out = JS_NewArrayBufferCopy(ctx, (const uint8_t *)String_val(r), caml_string_length(r));
+    CAMLdrop;
+  }
+  JS_FreeCString(ctx, alg);
+  if (kf) JS_FreeCString(ctx, kf);
+  if (df) JS_FreeCString(ctx, df);
+  return out;
+}
+static JSValue js_digest(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)t; return js_hash(ctx, argc, argv, 0); }
+static JSValue js_hmac(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)t; return js_hash(ctx, argc, argv, 1); }
+
 static int eval(struct cell *c, value src, const char *name) {
   JSContext *ctx = c->ctx;
   enter(c);
@@ -245,6 +341,7 @@ CAMLprim value celld_js_create(value prelude, value script, value conn) {
   CAMLlocal2(r, v);
   struct cell *c = calloc(1, sizeof *c);
   if (!c) caml_raise_out_of_memory();
+  c->pending = JS_UNDEFINED;
   c->db = celld_sql_handle(conn);
   c->rt = JS_NewRuntime2(&counted_malloc, NULL);
   if (!c->rt) { free(c); CAMLreturn(error_of(NULL)); }
@@ -257,6 +354,10 @@ CAMLprim value celld_js_create(value prelude, value script, value conn) {
   JS_SetContextOpaque(c->ctx, c);
   JSValue g = JS_GetGlobalObject(c->ctx);
   JS_SetPropertyStr(c->ctx, g, "__celld_sql_exec", JS_NewCFunction(c->ctx, js_sql_exec, "__celld_sql_exec", 2));
+  JS_SetPropertyStr(c->ctx, g, "__celld_log", JS_NewCFunction(c->ctx, js_log, "__celld_log", 2));
+  JS_SetPropertyStr(c->ctx, g, "__celld_random", JS_NewCFunction(c->ctx, js_random, "__celld_random", 1));
+  JS_SetPropertyStr(c->ctx, g, "__celld_digest", JS_NewCFunction(c->ctx, js_digest, "__celld_digest", 2));
+  JS_SetPropertyStr(c->ctx, g, "__celld_hmac", JS_NewCFunction(c->ctx, js_hmac, "__celld_hmac", 3));
   JS_FreeValue(c->ctx, g);
   if (!eval(c, prelude, "prelude.js") || !eval(c, script, "class.js")) {
     char *msg = exception_text(c->ctx);
@@ -270,7 +371,9 @@ CAMLprim value celld_js_create(value prelude, value script, value conn) {
   CAMLreturn(r);
 }
 
-/* call(cell, name, request_json) -> Ok string | Error message */
+static value settle(struct cell *c, JSValue p);
+
+/* call(cell, name, request_json) -> Ok (Done string | Suspended ops) | Error message */
 CAMLprim value celld_js_call(value cv, value name, value req) {
   CAMLparam3(cv, name, req);
   CAMLlocal1(r);
@@ -314,20 +417,53 @@ CAMLprim value celld_js_call(value cv, value name, value req) {
     if (m) memcpy(m, msg, sizeof msg);
     CAMLreturn(error_of(m));
   }
+  CAMLreturn(settle(c, p));
+}
+
+/* The result of a call or resume: Ok (Done s) | Ok (Suspended ops) | Error m. */
+static value outcome(int tag, const char *s, size_t n) {
+  CAMLparam0();
+  CAMLlocal2(o, r);
+  o = caml_alloc(1, tag);
+  Store_field(o, 0, caml_alloc_initialized_string(n, s));
+  r = caml_alloc(1, 0);
+  Store_field(r, 0, o);
+  CAMLreturn(r);
+}
+
+/* A drained dispatch promise [p] (owned): settled, or still waiting on
+   operations the node must perform (then kept for celld_js_resume). */
+static value settle(struct cell *c, JSValue p) {
+  JSContext *ctx = c->ctx;
   JSValue out;
   switch (JS_PromiseState(ctx, p)) {
   case JS_PROMISE_FULFILLED: out = JS_PromiseResult(ctx, p); break;
   case JS_PROMISE_REJECTED: {
     JS_Throw(ctx, JS_PromiseResult(ctx, p));
     JS_FreeValue(ctx, p);
-    CAMLreturn(error_of(exception_text(ctx)));
+    return error_of(exception_text(ctx));
   }
   case JS_PROMISE_PENDING: {
+    JSValue g = JS_GetGlobalObject(ctx);
+    JSValue take = JS_GetPropertyStr(ctx, g, "__celld_take_ops");
+    JSValue ops = JS_Call(ctx, take, g, 0, NULL);
+    JS_FreeValue(ctx, take);
+    JS_FreeValue(ctx, g);
+    size_t n = 0;
+    const char *s = JS_IsException(ops) ? NULL : JS_ToCStringLen(ctx, &n, ops);
+    JS_FreeValue(ctx, ops);
+    if (s && n > 0) {
+      c->pending = p;
+      value r = outcome(1, s, n);
+      JS_FreeCString(ctx, s);
+      return r;
+    }
+    if (s) JS_FreeCString(ctx, s);
     JS_FreeValue(ctx, p);
     static const char pending[] = "handler awaited something that never settles";
     char *m = malloc(sizeof pending);
     if (m) memcpy(m, pending, sizeof pending);
-    CAMLreturn(error_of(m));
+    return error_of(m);
   }
   default: out = JS_DupValue(ctx, p); /* not a promise */
   }
@@ -335,11 +471,45 @@ CAMLprim value celld_js_call(value cv, value name, value req) {
   size_t n;
   const char *s = JS_ToCStringLen(ctx, &n, out);
   JS_FreeValue(ctx, out);
-  if (!s) CAMLreturn(error_of(exception_text(ctx)));
-  r = caml_alloc(1, 0);
-  Store_field(r, 0, caml_alloc_initialized_string(n, s));
+  if (!s) return error_of(exception_text(ctx));
+  value r = outcome(0, s, n);
   JS_FreeCString(ctx, s);
-  CAMLreturn(r);
+  return r;
+}
+
+/* resume(cell, results_json): hand a suspended call the results of its
+   operations, then run it to its next settle point. */
+CAMLprim value celld_js_resume(value cv, value results) {
+  CAMLparam2(cv, results);
+  struct cell *c = Cell_val(cv);
+  if (!c) caml_failwith("js: cell disposed");
+  if (JS_IsUndefined(c->pending)) caml_failwith("js: no suspended call");
+  JSContext *ctx = c->ctx;
+  JSValue p = c->pending;
+  c->pending = JS_UNDEFINED;
+  enter(c);
+  JSValue g = JS_GetGlobalObject(ctx);
+  JSValue fn = JS_GetPropertyStr(ctx, g, "__celld_resume");
+  JSValue arg = JS_NewStringLen(ctx, String_val(results), caml_string_length(results));
+  JSValue rv = JS_Call(ctx, fn, g, 1, &arg);
+  JS_FreeValue(ctx, arg);
+  JS_FreeValue(ctx, fn);
+  JS_FreeValue(ctx, g);
+  JS_FreeValue(ctx, rv);
+  c->budget = CALL_BUDGET;
+  JSContext *failed = NULL;
+  if (!drain(c, &failed)) {
+    JS_FreeValue(ctx, p);
+    CAMLreturn(error_of(exception_text(failed)));
+  }
+  if (c->poisoned) {
+    JS_FreeValue(ctx, p);
+    static const char msg[] = "too many promise jobs in one call";
+    char *m = malloc(sizeof msg);
+    if (m) memcpy(m, msg, sizeof msg);
+    CAMLreturn(error_of(m));
+  }
+  CAMLreturn(settle(c, p));
 }
 
 CAMLprim value celld_js_poisoned(value cv) {
@@ -352,4 +522,13 @@ CAMLprim value celld_js_dispose(value cv) {
   if (c) cell_free(c);
   Cell_val(cv) = NULL;
   return Val_unit;
+}
+
+/* Bytes this cell's runtime has allocated, for memory-pressure shedding. */
+CAMLprim value celld_js_memory(value cv) {
+  struct cell *c = Cell_val(cv);
+  if (!c || !c->rt) return Val_long(0);
+  JSMemoryUsage u;
+  JS_ComputeMemoryUsage(c->rt, &u);
+  return Val_long(u.malloc_size);
 }

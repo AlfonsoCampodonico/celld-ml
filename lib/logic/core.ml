@@ -27,6 +27,7 @@ type cell = {
   mutable last_used_ms : int;
   mutable barriers : op list;  (** open write barriers, newest first *)
   mutable moving_to : peer option;  (** shed: hand off to this peer once quiet *)
+  mutable evict : bool;  (** release once quiet, no handoff *)
 }
 
 type barrier = {
@@ -95,7 +96,7 @@ let cell st id =
   match Hashtbl.find_opt st.cells id with
   | Some c -> c
   | None ->
-      let c = { id; phase = Inactive; waiters = []; active = 0; last_used_ms = st.now_ms; barriers = []; moving_to = None } in
+      let c = { id; phase = Inactive; waiters = []; active = 0; last_used_ms = st.now_ms; barriers = []; moving_to = None; evict = false } in
       Hashtbl.replace st.cells id c;
       c
 
@@ -513,7 +514,7 @@ let sweep st =
         match c.phase with
         | Resident { epoch; etag }
           when c.active = 0 && c.barriers = []
-               && (st.now_ms - c.last_used_ms >= st.config.idle_ms || c.moving_to <> None || st.draining) ->
+               && (st.now_ms - c.last_used_ms >= st.config.idle_ms || c.moving_to <> None || c.evict || st.draining) ->
             let op = fresh_op st in
             c.phase <- Ensuring { op; epoch; etag };
             Ensure_durable { op; cell = c.id; epoch } :: acc
@@ -553,6 +554,7 @@ let on_owner_released st op id _result =
   | Some ({ phase = Releasing { op = o; epoch }; _ } as c) when o = op -> (
       (* Rejected or ambiguous both end here: the next activation re-reads. *)
       c.phase <- Inactive;
+      c.evict <- false;
       let target = match c.moving_to with Some p -> Some p | None -> if st.draining then next_drain_target st else None in
       match target with
       | Some peer -> Hand_off { cell = id; peer } :: hand_to st c peer ~epoch
@@ -569,6 +571,12 @@ let on_shed st cells (target : peer) =
         | Some ({ phase = Resident _; _ } as c) -> c.moving_to <- Some target
         | _ -> ())
       cells;
+  []
+
+let on_evict st cells =
+  List.iter
+    (fun id -> match Hashtbl.find_opt st.cells id with Some ({ phase = Resident _; _ } as c) -> c.evict <- true | _ -> ())
+    cells;
   []
 
 let on_drain st targets =
@@ -627,6 +635,7 @@ let on_event st ~now_ms event =
     | Lease_cas_completed { op; result } -> on_lease_cas st op result
     | Followers_chosen peers -> on_followers_chosen st peers
     | Shed { cells; target } -> on_shed st cells target
+    | Evict cells -> on_evict st cells
     | Drain targets -> on_drain st targets
     | Drain_checked { op; result } -> on_drain_checked st op result
     | Timer_fired { timer; generation } -> on_timer st timer generation
