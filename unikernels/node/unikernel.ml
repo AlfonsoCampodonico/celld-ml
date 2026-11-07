@@ -834,6 +834,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
     let bip, bport = parse_addr (bucket_addr ()) in
     let bucket = B.create stack bip bport in
     let session = random_hex 8 in
+    Celld_sqlite.seed (Mirage_crypto_rng.generate 32);
     let config = { default_config with ttl_ms = ttl_ms (); idle_ms = idle_ms () } in
     let core = Core.create ~config ~node:me ~session ~addr:(advertise ()) () in
     let stream, push = Lwt_stream.create () in

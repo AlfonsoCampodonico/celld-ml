@@ -19,6 +19,14 @@
 
 #define PAGE 4096
 
+/* Limits: a cell is one serial actor's work, so a runaway statement or an
+   unbounded database would stall or starve the whole node. */
+#define MAX_PAGES 16384                       /* 64 MiB per database */
+#define MAX_IMAGE ((sqlite3_int64)(MAX_PAGES + 64) * PAGE)
+#define HEAP_LIMIT ((sqlite3_int64)96 << 20)  /* all of SQLite's memory */
+#define STEP_BUDGET 20000                     /* progress callbacks per statement */
+#define PROGRESS_EVERY 1000                   /* VM instructions per callback */
+
 /* ---- the database image ---- */
 
 struct img {
@@ -29,6 +37,7 @@ struct img {
 };
 
 static int img_reserve(struct img *m, sqlite3_int64 len) {
+  if (len > MAX_IMAGE) return 0;
   if (len > m->cap) {
     sqlite3_int64 cap = m->cap ? m->cap : 16 * PAGE;
     while (cap < len) cap *= 2;
@@ -60,7 +69,15 @@ static void img_free(struct img *m) {
 /* xOpen of the main database adopts this image (single-threaded). */
 static struct img *pending_main = NULL;
 static sqlite3_int64 now_ms = 0;
+/* Seeded from the node's CSPRNG through celld_sql_seed before first use;
+   the constant only keeps xorshift away from the all-zero state. */
 static unsigned long long rng = 0x9e3779b97f4a7c15ULL;
+static int budget = STEP_BUDGET;
+
+static int on_progress(void *arg) {
+  (void)arg;
+  return --budget <= 0; /* nonzero interrupts the statement */
+}
 
 /* ---- sqlite3_io_methods ---- */
 
@@ -243,11 +260,17 @@ CAMLprim value celld_sql_open(value image) {
   pending_main = c->img;
   int rc = sqlite3_open_v2("cell.db", &c->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "celld");
   pending_main = NULL;
-  if (rc == SQLITE_OK)
+  if (rc == SQLITE_OK) {
+    sqlite3_hard_heap_limit64(HEAP_LIMIT);
+    sqlite3_limit(c->db, SQLITE_LIMIT_LENGTH, 16 << 20);
+    sqlite3_limit(c->db, SQLITE_LIMIT_SQL_LENGTH, 1 << 20);
+    sqlite3_progress_handler(c->db, PROGRESS_EVERY, on_progress, NULL);
     rc = sqlite3_exec(c->db,
                       "PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF; "
-                      "PRAGMA locking_mode=EXCLUSIVE; PRAGMA temp_store=MEMORY;",
+                      "PRAGMA locking_mode=EXCLUSIVE; PRAGMA temp_store=MEMORY; "
+                      "PRAGMA max_page_count=16384;",
                       0, 0, 0);
+  }
   if (rc != SQLITE_OK) {
     if (c->db) sqlite3_close_v2(c->db);
     img_free(c->img);
@@ -259,6 +282,18 @@ CAMLprim value celld_sql_open(value image) {
   r = caml_alloc_custom(&conn_ops, sizeof(struct conn *), 0, 1);
   Conn_val(r) = c;
   CAMLreturn(r);
+}
+
+/* Mix entropy into the generator behind random() and randomblob(). */
+CAMLprim value celld_sql_seed(value bytes) {
+  const unsigned char *b = (const unsigned char *)String_val(bytes);
+  size_t n = caml_string_length(bytes);
+  for (size_t i = 0; i < n; i++) {
+    rng ^= (unsigned long long)b[i] << ((i % 8) * 8);
+    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+  }
+  if (!rng) rng = 0x9e3779b97f4a7c15ULL;
+  return Val_unit;
 }
 
 CAMLprim value celld_sql_set_now(value ms) {
@@ -327,6 +362,7 @@ CAMLprim value celld_sql_prepare(value v, value sql, value off) {
   int len = (int)(caml_string_length(sql) - Long_val(off));
   const char *tail = NULL;
   sqlite3_stmt *st = NULL;
+  budget = STEP_BUDGET; /* each statement gets the full budget */
   int rc = sqlite3_prepare_v2(db, start, len, &st, &tail);
   if (rc != SQLITE_OK) {
     r = caml_alloc(1, 1);

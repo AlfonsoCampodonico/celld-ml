@@ -6,6 +6,7 @@ type stmt
 
 external open_image : string -> db = "celld_sql_open"
 external set_now : int64 -> unit = "celld_sql_set_now"
+external seed : string -> unit = "celld_sql_seed"
 external errmsg : db -> string = "celld_sql_errmsg"
 external autocommit : db -> bool = "celld_sql_autocommit"
 external dirty : db -> int * (int * string) list = "celld_sql_dirty"

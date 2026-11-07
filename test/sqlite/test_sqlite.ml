@@ -39,3 +39,20 @@ let () =
   (match Sql.exec db2 "SELECT unixepoch()" with
   | Ok r -> check "clock comes from set_now" (r.rows = [ [ Some "1700000000" ] ])
   | Error e -> check e false)
+  ;
+  (* Limits: a runaway statement is interrupted, and the database cannot
+     grow past its page cap. *)
+  let db3 = Sql.open_image "" in
+  (match Sql.exec db3 "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c" with
+  | Error e -> check ("runaway query interrupted: " ^ e) true
+  | Ok _ -> check "runaway query interrupted" false);
+  (match Sql.exec db3 "SELECT 1" with
+  | Ok r -> check "connection usable after interrupt" (r.rows = [ [ Some "1" ] ])
+  | Error e -> check e false);
+  ignore (Sql.exec db3 "CREATE TABLE big(b BLOB)");
+  let rec fill n = if n = 0 then None else match Sql.exec db3 "INSERT INTO big VALUES (zeroblob(1000000))" with Ok _ -> fill (n - 1) | Error e -> Some e in
+  check "page cap stops growth" (fill 100 <> None);
+  Sql.seed "some entropy";
+  (match Sql.exec db3 "SELECT random() <> random()" with
+  | Ok r -> check "seeded random" (r.rows = [ [ Some "1" ] ])
+  | Error e -> check e false)
