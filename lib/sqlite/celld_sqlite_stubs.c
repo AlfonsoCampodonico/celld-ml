@@ -243,6 +243,10 @@ static struct conn *conn_of(value v) {
   return c;
 }
 
+/* For the JS runtime (lib/js), which runs SQL on a cell's connection. */
+sqlite3 *celld_sql_handle(value v) { return conn_of(v)->db; }
+void celld_sql_reset_budget(void) { budget = STEP_BUDGET; }
+
 /* Open a connection over [image] (empty for a new database). */
 CAMLprim value celld_sql_open(value image) {
   CAMLparam1(image);

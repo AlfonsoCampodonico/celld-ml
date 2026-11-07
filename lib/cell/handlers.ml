@@ -4,10 +4,10 @@
 
 module M = Store.M
 
-type reply = { status : int; body : string; wrote : bool }
+type reply = { status : int; body : string; wrote : bool; content_type : string }
 
-let ok ?(wrote = false) body = { status = 200; body; wrote }
-let err status body = { status; body; wrote = false }
+let ok ?(wrote = false) body = { status = 200; body; wrote; content_type = "text/plain" }
+let err status body = { status; body; wrote = false; content_type = "text/plain" }
 
 let int_of k kv = match M.find_opt k kv with Some v -> int_of_string_opt v |> Option.value ~default:0 | None -> 0
 
@@ -131,7 +131,7 @@ let sql (s : Store.t) ~meth ~path ~query:_ ~body =
         else
           match r with
           | Error e -> err 400 (e ^ "\n")
-          | Ok rs -> { status = 200; body = json_result rs; wrote = Store.changed s }
+          | Ok rs -> { status = 200; body = json_result rs; wrote = Store.changed s; content_type = "application/json" }
       in
       match meth, path with
       | "POST", "/query" -> run body
@@ -143,8 +143,6 @@ let sql_alarm (s : Store.t) =
   Option.iter
     (fun db -> ignore (Celld_sqlite.exec db "CREATE TABLE IF NOT EXISTS alarms_fired(at INTEGER); INSERT INTO alarms_fired VALUES (unixepoch('subsec') * 1000)"))
     s.sql
-
-let is_sql cell = String.length cell > 4 && String.sub cell 0 4 = "Sql:"
 
 let class_of cell = match String.index_opt cell ':' with Some i -> String.sub cell 0 i | None -> "Counter"
 
@@ -159,3 +157,35 @@ let dispatch cell : handler option =
   | "Kv" -> Some (with_alarm kv_alarm kv)
   | "Sql" -> Some (with_alarm sql_alarm sql)
   | _ -> None
+
+(* ---- JS classes ----
+   Any other class name is a JS class whose script lives in the bucket at
+   classes/<Class>.js. Its storage is the cell's SQLite database, and each
+   call runs inside a savepoint: a handler that throws leaves no writes. *)
+
+let is_js cell = String.contains cell ':' && dispatch cell = None
+let is_sql cell = class_of cell = "Sql" || is_js cell
+
+let valid_class c =
+  let n = String.length c in
+  n > 0 && n <= 64 && String.for_all (function 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> true | _ -> false) c
+
+let in_savepoint (s : Store.t) f =
+  match s.sql with
+  | None -> f ()
+  | Some db -> (
+      ignore (Celld_sqlite.exec db "SAVEPOINT celld_req");
+      match f () with
+      | Ok _ as r -> ignore (Celld_sqlite.exec db "RELEASE celld_req"); r
+      | Error _ as r -> ignore (Celld_sqlite.exec db "ROLLBACK TO celld_req; RELEASE celld_req"); r)
+
+let js (rt : Celld_js.t) cell : handler =
+  let on_alarm s =
+    match in_savepoint s (fun () -> Celld_js.call rt ~name:"alarm" ~cell ~meth:"" ~path:"" ~query:[] ~body:"") with
+    | Ok _ -> ()
+    | Error e -> prerr_endline ("alarm handler failed for " ^ cell ^ ": " ^ e)
+  in
+  with_alarm on_alarm (fun s ~meth ~path ~query ~body ->
+      match in_savepoint s (fun () -> Celld_js.call rt ~name:"fetch" ~cell ~meth ~path ~query ~body) with
+      | Ok r -> { status = r.status; body = r.body; wrote = Store.changed s; content_type = r.content_type }
+      | Error e -> err 500 ("uncaught exception: " ^ e ^ "\n"))

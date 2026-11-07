@@ -1,0 +1,22 @@
+; QuickJS (MIT, Fabrice Bellard and Charlie Gordon; vendored release
+; 2026-06-04, engine only) and the JS cell runtime binding.
+(library
+ (name celld_js)
+ (libraries celld_sqlite)
+ (foreign_stubs
+  (language c)
+  (names
+   celld_qjs_quickjs
+   celld_qjs_libregexp
+   celld_qjs_libunicode
+   celld_qjs_cutils
+   celld_qjs_dtoa
+   celld_js_stubs)
+  (include_dirs compat quickjs ../sqlite)
+  (extra_deps
+   celld_qjs_prefix.h
+   compat/fenv.h
+   (glob_files quickjs/*.c)
+   (glob_files quickjs/*.h))
+  (flags
+   (:standard -O2 -w -DNDEBUG -D_GNU_SOURCE "-DCONFIG_VERSION=\"2026-06-04\""))))

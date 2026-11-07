@@ -19,7 +19,7 @@ ip link show br0 >/dev/null 2>&1 || bash "$root/scripts/net.sh"
 
 boot() { # name tap image args...
   local name=$1 tap=$2 image=$3; shift 3
-  sg kvm -c "exec $hvt --mem=256 --net:service=$tap $* " </dev/null >"$run/$name.log" 2>&1 &
+  sg kvm -c "exec $hvt --mem=512 --net:service=$tap $* " </dev/null >"$run/$name.log" 2>&1 &
   echo $! >"$run/$name.pid"
 }
 

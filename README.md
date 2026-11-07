@@ -7,10 +7,11 @@ unikernel on Solo5 `hvt` (KVM).
 celld runs distributed Durable Objects with no consensus service. A *cell*
 is a named object. A conditional write in an object-store bucket makes
 exactly one node its owner, and every committed write is captured as an LTX
-file. This fork keeps that design. `Sql:` cells are SQLite databases
-running inside the unikernel. `Counter:` and `Kv:` cells are native OCaml
-handlers over a paged KV store. There is no V8 or Workers runtime yet. See
-[DESIGN.md](DESIGN.md) for the mapping.
+file. This fork keeps that design. Cells of any class you deploy run
+JavaScript on QuickJS, with a Durable Object-style `ctx.storage` backed by
+the cell's own SQLite database. `Sql:` cells expose SQLite directly, and
+`Counter:` and `Kv:` cells are native OCaml handlers. All of it runs inside
+the unikernel. See [DESIGN.md](DESIGN.md) for the mapping.
 
 ## How it fits together
 
@@ -168,6 +169,18 @@ claim its cells.
   and returns the last result set as JSON, and `GET /` lists the tables. A
   request that leaves a transaction open is rolled back, so each commit is
   one request.
+- **JS cells.** Every class other than `Counter`, `Kv` and `Sql` is a script
+  stored in the bucket at `classes/<Class>.js`. Deploy one with
+  `PUT /.well-known/celld/classes/<Class>`. Each resident cell gets its own
+  QuickJS context: the engine is interpreter-only, single-threaded C, so it
+  runs where V8 cannot. A script defines `fetch(request, ctx)` and optionally
+  `alarm(ctx)`, and may return a `Response`, a string, a JSON value or a
+  promise. `ctx.storage.sql.exec(query, ...bindings)` runs SQL on the cell's
+  SQLite database. `ctx.storage.get/put/delete/list` are a KV on top of it.
+  Each call runs in a savepoint, so a handler that throws leaves no writes.
+  Every call has an instruction budget and the runtime has a memory limit,
+  so a runaway script fails without stalling the node.
+  [examples/chat.js](examples/chat.js) is a chat room.
 - **Alarms.** `PUT /do/<cell>/__alarm?in_ms=N` (or `?at_ms=T`) sets the
   cell's one alarm, and `GET` or `DELETE` read or clear it. The alarm is a
   key in the cell's own state, so it is captured, replicated and moves with
@@ -187,6 +200,7 @@ The fork leaves out queues, cron, WebSockets and the tunnel. A forwarded request
 | `lib/logic` | the core: types, phases, `on_event` |
 | `lib/ltx` | the LTX format, CRC-64, and an LZ4 block codec written from the format spec |
 | `lib/cell` | the page store (KV or SQLite), capture, restore planning, GC, and the cell classes |
+| `lib/js` | the vendored QuickJS engine (2026-06-04), the Solo5 shims it needs, and the JS cell runtime: prelude, storage binding, budgets |
 | `lib/sqlite` | the vendored SQLite amalgamation, an in-memory VFS with dirty-page tracking, and the OCaml binding |
 | `lib/wire` | JSON records, the `CLA1` log batch, and peer signing helpers |
 | `lib/http`, `lib/http/mirage`, `lib/bucketc` | HTTP/1.1, plus server and client over mirage-tcpip, plus the bucket client |
@@ -260,6 +274,11 @@ dune build @runtest --root . --build-dir _build_all
   and refused a request that left a transaction open. It compacted from 18
   files to 1 snapshot plus a few, and after its owner was killed the new
   owner restored all 40 rows at e2.
+- **JS cells:** the `Chat` class from `examples/chat.js` was deployed through
+  n1 and took messages through n2 and n3. A message that made the handler
+  throw left no row behind, the JS alarm ran, and after the owner was
+  killed the next node restored the room with its messages, KV entries and
+  alarm count.
 - **Alarms:** an alarm fired on its owner's timer, an alarm on a cell
   evicted 5 s earlier woke it at e2 and fired once, and an alarm whose
   owner was killed fired on the node that took over. The `alarms/` index

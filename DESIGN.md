@@ -34,9 +34,12 @@ What carries over from celld:
 - **Signed peer HTTP.** HMAC-SHA256 with a fleet secret created once in
   `fleet/peer-auth.json`.
 
-What does not carry over: V8 and the Workers runtime. `Sql:` cells run
-SQLite inside the unikernel, with an in-memory VFS whose dirty pages become
-each commit's LTX file. `Counter:` and `Kv:` cells run native OCaml handlers
+What does not carry over: V8. JS cells run on QuickJS instead, because a
+Solo5 unikernel has no threads and no executable memory for a JIT, and
+QuickJS is an interpreter-only, single-threaded engine. Each JS cell gets a
+context with Workers-style `fetch`/`Response` and a `ctx.storage` backed by
+the cell's SQLite database. SQLite runs inside the unikernel, with an
+in-memory VFS whose dirty pages become each commit's LTX file. `Counter:` and `Kv:` cells run native OCaml handlers
 over a KV map paged into 4 KiB pages. Starting and Publishing are folded into
 Restoring. There are no queues or cron.
 

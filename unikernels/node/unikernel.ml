@@ -74,7 +74,12 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
   (* What this node holds for other leaders, keyed by leader session. *)
   type held = { mutable sealed : bool; entries : (int, Wire.entry) Hashtbl.t }
 
-  type runtime = { store : Store.t; epoch : int; mutable snap_txid : int  (** last snapshot the bucket has *) }
+  type runtime = {
+    store : Store.t;
+    epoch : int;
+    mutable snap_txid : int;  (** last snapshot the bucket has *)
+    js : Celld_js.t option;  (** the class script's context, for JS classes *)
+  }
 
   type t = {
     stack : S.t;
@@ -411,6 +416,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
   let alarm_hook : (t -> cell_id -> int -> unit) ref = ref (fun _ _ _ -> ())
   let push_alarm t cell at = !alarm_hook t cell at
 
+  let class_key c = "classes/" ^ c ^ ".js"
+
   (* ---- compaction and epoch GC ----
      Derived data, so none of it goes through the node log or the output
      gate: a lost snapshot or a failed delete only leaves more files. *)
@@ -451,13 +458,25 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         | ok, [] -> (
             match Store.restore ~sql:(Handlers.is_sql cell) (List.map Result.get_ok ok) with
             | Error e -> Lwt.return (Error e)
-            | Ok store ->
-                Hashtbl.replace t.runtimes cell { store; epoch; snap_txid = Int64.to_int store.txid };
+            | Ok store -> (
+                (if Handlers.is_js cell then
+                   B.get t.bucket (class_key (Handlers.class_of cell)) >|= function
+                   | Ok (Some (script, _)) -> (
+                       match store.sql with
+                       | Some db -> Result.map Option.some (Celld_js.create ~script ~db)
+                       | None -> Error "JS cell without a database")
+                   | Ok None -> Error ("no script for class " ^ Handlers.class_of cell ^ "; PUT it to /.well-known/celld/classes/" ^ Handlers.class_of cell)
+                   | Error f -> Error (string_of_failure (fail_of f))
+                 else Lwt.return (Ok None))
+                >>= function
+                | Error e -> Lwt.return (Error e)
+                | Ok js ->
+                Hashtbl.replace t.runtimes cell { store; epoch; snap_txid = Int64.to_int store.txid; js };
                 (* Each epoch opens with a snapshot of what it restored. *)
                 if store.txid > 0L then capture t cell epoch store.txid (Store.snapshot store);
                 Log.info (fun m -> m "restored %s at e%d (txid %Ld, %d files)" cell epoch store.txid (List.length ok));
                 Option.iter (fun at -> push_alarm t cell at) (Handlers.alarm_of store);
-                Lwt.return (Ok ()))
+                Lwt.return (Ok ())))
         (* A previous owner's GC can delete a file between our list and get. *)
         | _, Error _ :: _ when not retried -> restore ~retried:true t cell epoch
         | _, Error e :: _ -> Lwt.return (Error e)
@@ -579,6 +598,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
             wait 100 >|= fun result -> push t (Durability_checked { op; cell; result }))
     | Stop_runtime { op; cell; epoch; reset } ->
         Log.info (fun m -> m "stopping %s at e%d%s" cell epoch (if reset then " (reset)" else ""));
+        (match Hashtbl.find_opt t.runtimes cell with Some { js = Some js; _ } -> Celld_js.dispose js | _ -> ());
         Hashtbl.remove t.runtimes cell;
         Hashtbl.remove t.alarm_timers cell;
         (* Ensure_durable ran first, so this epoch's files are all in the
@@ -666,7 +686,8 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
           keys
 
   and run_local t req cell epoch ~meth ~path ~query ~body =
-    match Hashtbl.find_opt t.runtimes cell, Handlers.dispatch cell with
+    let handler rt = match rt.js with Some js -> Some (Handlers.js js cell) | None -> Handlers.dispatch cell in
+    match Hashtbl.find_opt t.runtimes cell, Option.bind (Hashtbl.find_opt t.runtimes cell) handler with
     | Some rt, Some handler when rt.epoch = epoch ->
         (* Handler and commit run without yielding: the cell is serial. *)
         let alarm_before = Handlers.alarm_of rt.store in
@@ -694,7 +715,12 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         push t (Output_at { req; position });
         (* The output gate: nothing leaves until the core releases it. *)
         p >|= (function
-        | Ok () -> { Celld_http.status = reply.status; headers = [ ("x-celld-node", t.me); ("x-celld-epoch", string_of_int epoch) ]; body = reply.body }
+        | Ok () ->
+            {
+              Celld_http.status = reply.status;
+              headers = [ ("content-type", reply.content_type); ("x-celld-node", t.me); ("x-celld-epoch", string_of_int epoch) ];
+              body = reply.body;
+            }
         | Error e -> text 503 ("write not acknowledged: " ^ string_of_request_error e ^ "\n"))
     | _ ->
         let p, u = Lwt.wait () in
@@ -758,8 +784,23 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         Log.info (fun m -> m "draining to [%s]" (String.concat "," (List.map (fun p -> p.p_node) targets)));
         push t (Drain targets);
         Lwt.return (text 202 "draining\n")
+    | _ when String.length (fst (Celld_http.path_and_query r.target)) > 27
+             && String.sub (fst (Celld_http.path_and_query r.target)) 0 27 = "/.well-known/celld/classes/" -> (
+        let path = fst (Celld_http.path_and_query r.target) in
+        let cls = String.sub path 27 (String.length path - 27) in
+        if not (Handlers.valid_class cls) || Handlers.dispatch (cls ^ ":x") <> None then Lwt.return (text 400 "bad class name\n")
+        else
+          match r.meth with
+          | "PUT" -> (
+              B.put t.bucket (class_key cls) r.body >|= function
+              | Ok (`Ok _) ->
+                  Log.info (fun m -> m "deployed class %s (%d bytes)" cls (String.length r.body));
+                  text 200 ("deployed " ^ cls ^ "; cells pick it up when they next activate\n")
+              | _ -> text 503 "could not store the script\n")
+          | "GET" -> (B.get t.bucket (class_key cls) >|= function Ok (Some (s, _)) -> { Celld_http.status = 200; headers = [ ("content-type", "text/javascript") ]; body = s } | _ -> text 404 "no such class\n")
+          | _ -> Lwt.return (text 405 "PUT or GET\n"))
     | _ when fst (Celld_http.path_and_query r.target) = "/state" -> Lwt.return { Celld_http.status = 200; headers = [ ("content-type", "application/json") ]; body = state_json t }
-    | Some (cell, path, query) when Handlers.valid_cell cell && Handlers.dispatch cell <> None ->
+    | Some (cell, path, query) when Handlers.valid_cell cell && (Handlers.dispatch cell <> None || Handlers.is_js cell) ->
         serve_cell t cell ~meth:r.meth ~path ~query ~body:r.body
     | Some _ -> Lwt.return (text 404 "unknown cell class (Counter:<id>, Kv:<id> or Sql:<id>)\n")
     | None -> Lwt.return (text 404 "try /do/Counter:<id>/increment or /do/Kv:<id>/<key>\n")
@@ -779,7 +820,7 @@ module Make (S : Tcpip.Stack.V4V6) (Blk : Mirage_block.S) = struct
         | "POST", "/peer/activate" -> (
             (* Resolve the cell as a request would, without running a handler. *)
             match Celld_http.header "x-cells-scope" r.headers with
-            | Some cell when Handlers.valid_cell cell && Handlers.dispatch cell <> None -> (
+            | Some cell when Handlers.valid_cell cell && (Handlers.dispatch cell <> None || Handlers.is_js cell) -> (
                 (* A cached route may still name the node handing it over. *)
                 push t (Invalidate_remote cell);
                 resolve t cell >>= fun (req, route) ->
